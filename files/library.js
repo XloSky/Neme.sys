@@ -8971,7 +8971,7 @@ function NemesisSystem(hook) {
 
     // Turns a vetoed return waits before it may be offered again.
     const VETO_COOLDOWN = 2;
-    const VERSION = "v0.4.6-alpha";
+    const VERSION = "v0.4.5-alpha";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
@@ -9100,7 +9100,7 @@ function NemesisSystem(hook) {
         old.debugContext ??= {};
         old.debugOutput ??= {};
         old.stages ??= {};
-        old.undoStack ??= [];
+        old.undo ??= null;
         old.pendingReturn ??= null;
         old.firstHook ??= null;
         old.configCreated ??= null;
@@ -9438,43 +9438,34 @@ function NemesisSystem(hook) {
      * The replacement generation, if it still qualifies, simply writes again.
      */
     const rollbackDiscardedWrite = () => {
-        const stack = Array.isArray(NS.undoStack) ? NS.undoStack : [];
-        if (!stack.length) return false;
-        const undone = [];
-        // Erase does not run modifiers, so rollback happens on the first
-        // generation AFTER the erase. A normal forward turn always grows history
-        // past the length a write was made at; Retry and Erase do not. Unwind
-        // newest-first so chained writes to the same card restore correctly, and
-        // keep going in case several generations were discarded at once.
-        while (stack.length) {
-            const undo = stack[stack.length - 1];
-            if (!undo || typeof undo !== "object" || !undo.name) { stack.pop(); continue; }
-            if (history.length > undo.len) break;   // this write survived
-            stack.pop();
-            const card = findNemesisCard(undo.name);
-            if (card) {
-                if (undo.created) {
-                    const index = storyCards.indexOf(card);
-                    if (index !== -1) {
-                        if (typeof removeStoryCard === "function") removeStoryCard(index);
-                        else storyCards.splice(index, 1);
-                    }
-                    delete NS.cards[undo.name];
-                    delete NS.lastSeen[undo.name];
-                    undone.push(`removed ${undo.name}`);
-                } else if (typeof undo.prevDescription === "string") {
-                    card.description = undo.prevDescription;
-                    syncEntryFromNotes(card);
-                    undone.push(`reverted ${undo.name}`);
+        const undo = NS.undo;
+        if (!undo || typeof undo !== "object" || !undo.name) return false;
+        if (history.length > undo.len) {
+            // The write survived into committed history. Nothing to undo.
+            NS.undo = null;
+            return false;
+        }
+        const card = findNemesisCard(undo.name);
+        if (card) {
+            if (undo.created) {
+                // The discarded generation is the only reason this card exists.
+                const index = storyCards.indexOf(card);
+                if (index !== -1) {
+                    if (typeof removeStoryCard === "function") removeStoryCard(index);
+                    else storyCards.splice(index, 1);
                 }
+                delete NS.cards[undo.name];
+                delete NS.lastSeen[undo.name];
+            } else if (typeof undo.prevDescription === "string") {
+                card.description = undo.prevDescription;
+                syncEntryFromNotes(card);
             }
         }
-        NS.undoStack = stack;
-        if (!undone.length) return false;
         // Let the replacement generation be analysed from scratch.
         NS.lastCommitHash = "";
         NS.lastAnalysisHash = "";
-        NS.stages.rolledBack = undone.join(", ");
+        NS.undo = null;
+        NS.stages.rolledBack = undo.created ? `removed ${undo.name}` : `reverted ${undo.name}`;
         return true;
     };
 
@@ -10357,17 +10348,13 @@ ${returnSectionCompact}</SYSTEM>` : "";
             NS.debugOutput.card = existing ? "updated" : "created";
             NS.stages.cardWritten = true;
             NS.stages.cardVerified = findNemesisCard(name) !== null;
-            // Undo record. See rollbackDiscardedWrite() for how this is consumed.
-            NS.undoStack = Array.isArray(NS.undoStack) ? NS.undoStack : [];
-            NS.undoStack.push({
+            // One-deep undo. See rollbackDiscardedWrite() for how this is consumed.
+            NS.undo = {
                 name,
                 prevDescription,
                 created: !existing,
                 len: history.length
-            });
-            // Bounded: enough to unwind a multi-generation erase, small enough
-            // that state stays tiny.
-            while (NS.undoStack.length > 8) NS.undoStack.shift();
+            };
         }
 
         if (validBookkeepingSeen && NS.pendingAnalysisHash) {
