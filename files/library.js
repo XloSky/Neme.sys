@@ -8999,9 +8999,21 @@ function NemesisSystem(hook) {
         debug: false,
     });
 
+    // AI Dungeon shows a 1000-character budget on a Story Card Entry. Notes has
+    // far more room, so the Entry is the constraint on how long a rivalry can run.
+    const ENTRY_BUDGET = 1000;
+    const ENTRY_HEADER = [
+        "> DO NOT EDIT THIS ENTRY — It is automatically generated from the Notes section.",
+        "> To correct Nemesis continuity, edit Notes instead. Manual Entry changes may be overwritten.",
+        "",
+        ""
+    ].join("\n");
+
     // Turns a vetoed return waits before it may be offered again.
     const VETO_COOLDOWN = 2;
-    const VERSION = "v0.6.6-alpha";
+    // A return is a REAPPEARANCE, so it requires an actual absence.
+    const MIN_ABSENCE_TURNS = 3;
+    const VERSION = "v0.7.1-alpha";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
@@ -9495,6 +9507,52 @@ function NemesisSystem(hook) {
         ].join("\n");
     };
 
+    // A long rivalry outgrows the Entry. Notes is the source of truth and keeps
+    // everything; the Entry is a generated mirror, so when it will not fit we
+    // condense the MIRROR rather than losing the record. History is
+    // chronological, so keep how the rivalry started and where it stands now and
+    // elide the middle — that is the part a reader can most afford to lose.
+    const condenseHistory = (value, allowance) => {
+        const s = safeLine(value, 1500);
+        if (s.length <= allowance) return s;
+        const parts = s.split(/\s*;\s*/).filter(Boolean);
+        if (parts.length < 3) return `${s.slice(0, Math.max(1, allowance - 1)).trimEnd()}…`;
+        const first = parts[0];
+        const tail = [];
+        let used = first.length + 5;                       // "; …; "
+        for (let i = parts.length - 1; i > 0; i--) {
+            if (used + parts[i].length + 2 > allowance) break;
+            tail.unshift(parts[i]);
+            used += parts[i].length + 2;
+        }
+        if (!tail.length) return `${first.slice(0, Math.max(1, allowance - 1)).trimEnd()}…`;
+        return `${first}; …; ${tail.join("; ")}`;
+    };
+    const renderEntryBody = snap => {
+        const full = renderSnapshot(snap);
+        if (ENTRY_HEADER.length + full.length <= ENTRY_BUDGET) return full;
+        // History is the field that grows without bound; spend the overrun there
+        // before touching anything describing their current state.
+        const skeleton = renderSnapshot({ ...snap, history: "" }).length;
+        const allowance = ENTRY_BUDGET - ENTRY_HEADER.length - skeleton;
+        let body = renderSnapshot({ ...snap, history: condenseHistory(snap.history, Math.max(48, allowance)) });
+        if (ENTRY_HEADER.length + body.length <= ENTRY_BUDGET) return body;
+        // Still over: the current-state fields are themselves oversized. Trim the
+        // descriptive ones, newest-information-last, before any hard truncation.
+        for (const cap of [220, 140, 90, 60]) {
+            body = renderSnapshot({
+                ...snap,
+                history: condenseHistory(snap.history, Math.max(48, allowance)),
+                relationships: safeLine(snap.relationships, cap),
+                capabilities: safeLine(snap.capabilities, cap),
+                physical: safeLine(snap.physical, cap),
+                drive: safeLine(snap.drive, cap),
+            });
+            if (ENTRY_HEADER.length + body.length <= ENTRY_BUDGET) return body;
+        }
+        return body.slice(0, Math.max(0, ENTRY_BUDGET - ENTRY_HEADER.length));
+    };
+
     const syncEntryFromNotes = card => {
         if (!isNemesisCard(card)) return;
         const name = cardName(card);
@@ -9508,12 +9566,7 @@ function NemesisSystem(hook) {
             body
         ].join("\n");
 
-        card.entry = [
-            "> DO NOT EDIT THIS ENTRY — It is automatically generated from the Notes section.",
-            "> To correct Nemesis continuity, edit Notes instead. Manual Entry changes may be overwritten.",
-            "",
-            body
-        ].join("\n");
+        card.entry = ENTRY_HEADER + renderEntryBody(snapshot);
 
         card.keys = name;
         card.type = CARD_TYPE;
@@ -9912,6 +9965,20 @@ function NemesisSystem(hook) {
             if (CONFIRMED_DEAD.test(String(snap.status || ""))) return false;
             if (String(snap.returnState).toLowerCase() === "closed") return false;
             const unseen = turn() - (NS.lastSeen[snap.name] ?? -999999);
+            // You cannot RE-enter a scene you never left. "eligible" had no
+            // absence test at all, so a Nemesis the story was actively handling
+            // could be offered a return while standing in the room. lastSeen is
+            // refreshed both by their name appearing in recent text AND by any
+            // record written for them, so this reads as "the story is still
+            // dealing with this character right now".
+            //
+            // Reported live: a wounded soldier was captured and carried to a
+            // medical tent, and the prose then called her "the prisoner" and
+            // "she" for several turns. Her NAME never appeared, so the name check
+            // cleared her, her card said eligible, and the model was told to
+            // bring her into the scene she was already lying in. It resolved that
+            // by putting her back on the battlefield under debris, every retry.
+            if (unseen < MIN_ABSENCE_TURNS) return false;
             const stalePresent = snap.returnState === "present" && cfg.stalePresentTurns <= unseen;
             // Dormant decays back to returnable. Nothing writes a Nemesis card
             // while its subject is offscreen, so a living Nemesis marked dormant
@@ -9995,9 +10062,18 @@ Track only evolving current truth: lasting injuries/scars/replacements, life sta
 Judge only events already established by narration before the current unresolved Do/Say attempt.
     `.trim();
 
+    // Two triggers. The Notes limit is the player-facing "this card is getting
+    // long" signal; the Entry pressure test is the one that matters, because the
+    // Entry is what AI Dungeon budgets and what the model reads. Keying only on
+    // Notes let a card reach 1122/1000 in the Entry while Notes was still well
+    // under its limit — the script then has to elide mechanically, which loses
+    // wording the model could have compressed meaningfully instead. 75% leaves a
+    // real runway: the model gets several turns to compress semantically before
+    // the Entry hits the budget and mechanical elision takes over.
     const maintenanceTarget = (cards, cfg) => cards
-        .filter(({ card }) => String(card.description || "").length > cfg.historySoftLimit)
-        .sort((a, b) => String(b.card.description || "").length - String(a.card.description || "").length)[0] || null;
+        .filter(({ card }) => String(card.description || "").length > cfg.historySoftLimit
+            || String(card.entry || "").length >= ENTRY_BUDGET * 0.75)
+        .sort((a, b) => String(b.card.entry || "").length - String(a.card.entry || "").length)[0] || null;
 
     // Make a small amount of room by trimming only the oldest Recent Story text.
     // This is used only when Inner Self or a large scenario has already filled the
@@ -10205,6 +10281,7 @@ Named recurring opponents need not fight to the death. According to personality,
 ## RETURN OPPORTUNITY — ${rc}
 ${snapshotForPrompt(returnCandidate.snap)}
 ${rc} has been off-screen and is eligible to re-enter the story. Bring ${rc} into THIS scene unless something concrete already established makes it impossible right now (location, travel time, access, knowledge, injuries, world rules).
+If ${rc} is ALREADY in this scene — present, held, captive, unconscious, or under guard — this offer is void. Do not stage a second entrance for someone who never left, and never move them somewhere else to justify one.
 Their reappearance is itself a deliberate act — they chose this moment and this
 ground. If their drive still describes a momentary reaction from the encounter
 that created them, it is out of date; re-state it as what they are pursuing now.
@@ -10216,7 +10293,7 @@ If it is genuinely impossible right now, write the scene without mentioning them
 ` : "";
         const returnSectionCompact = returnCandidate ? `
 ## RETURN OPPORTUNITY — ${rc}
-${rc} has been absent ${offscreenTurns} accepted turns (a staleness signal, not elapsed fictional time) and is eligible. Bring ${rc} into this scene unless established facts make it impossible. Their reappearance is itself a deliberate act — they chose this moment, so a drive that is still a momentary reaction from the last encounter is out of date. Reassess drive/relationships/urgency; change them only where the story supports it. Their Drive decides how: attack, ambush, watch, stalk, threaten, avoid, negotiate, ask for help, repay a debt, betray or assist. Never teleport them. If impossible, do not mention them.
+${rc} has been absent ${offscreenTurns} accepted turns (a staleness signal, not elapsed fictional time) and is eligible. Bring ${rc} into this scene unless established facts make it impossible, or unless they are already in it — present, held or captive — in which case do not stage a second entrance. Their reappearance is itself a deliberate act — they chose this moment, so a drive that is still a momentary reaction from the last encounter is out of date. Reassess drive/relationships/urgency; change them only where the story supports it. Their Drive decides how: attack, ambush, watch, stalk, threaten, avoid, negotiate, ask for help, repay a debt, betray or assist. Never teleport them. If impossible, do not mention them.
 Winning promotes nobody by itself; show what their last outcome changed only if it actually changed something — most wins are just wins.
 Current: ${safeLine(returnCandidate.snap.physical)} | ${safeLine(returnCandidate.snap.drive)}${stanceNote}
 ` : "";
@@ -10258,7 +10335,7 @@ If the encounter is genuinely still undecided, continue it normally.
             ? `Nemeses that ALREADY have a card (send deltas for these): ${knownNames.join(", ")}.`
             : "No Nemesis cards exist yet; any qualifying record is a creation.";
         const maintenancePrompt = maintenance
-            ? `Maintenance target: ${maintenance.snap.name}. Compress redundant History and Relationships while preserving current physical deviations, life status, major betrayal, rank/status, and causes.\n${snapshotForPrompt(maintenance.snap)}`
+            ? `Maintenance target: ${maintenance.snap.name}. This card is near its display limit. Rewrite History shorter WITHOUT losing an event: keep how the rivalry started, every outcome that changed them, and where it stands now; collapse repeated confrontations of the same kind into one clause that says how many and what came of them. Losing wording is fine, losing an event is not. Compress Relationships too if it repeats History.\n${snapshotForPrompt(maintenance.snap)}`
             : "";
 
         // The full task sits close to the context ceiling once Inner Self's own
@@ -10374,6 +10451,19 @@ OUTCOME DRIVERS — what an encounter changes about them
 - They return after an absence -> new gear, allies or methods go in capabilities.
   physical is only ever their body.
 
+UNRESOLVED NEMESES ESCALATE, THEY DO NOT RESET
+Defeat, humiliation, injury, a failed plan or a lost resource never returns a
+Nemesis to an earlier baseline. The story may take the SPECIFIC thing it actually
+took — an ally killed, equipment destroyed, ground lost, a wound that impairs
+them — and they answer that loss by adapting again in a new direction: different
+allies, better preparation, traps, patience, leverage, indirect attacks, a
+changed objective, or striking at what ${playerRef} values instead of at
+${playerRef}. Humiliation is fuel, not a resolution; it usually intensifies or
+twists a rivalry. While they live and the matter between them is unresolved, do
+not write them broken, resigned, or conceding that ${playerRef} has won. A low
+point is part of an arc, not the end of one. Only an outcome the story genuinely
+establishes closes a rivalry.
+
 ADAPTATION MUST RESPECT ESTABLISHED CAPABILITY
 capabilities is the whole list of what a Nemesis can bring beyond ordinary
 ability. Losing teaches a lesson, and a lesson is not a new power. Adaptation by
@@ -10461,6 +10551,7 @@ The record comes first (after any required Inner Self parenthetical), then the s
 After any REQUIRED Inner Self parenthetical operation, the next text MUST be ${START}. Emit exactly one Nemesis record, close it with ${END}, then write normal story prose. The story must be most of the output.
 A named/identifiable NPC qualifies for major unresolved personal history: permanent severe injury with survival, near-death, major defeat/betrayal, sparing/humiliation, personal revenge/threat, repeated major conflict, or major debt/rescue. Permanent crippling injury plus survival is sufficient. Minor hostility is not.
 You MAY use the current Do/Say action only if the continuation you are about to write actually establishes that qualifying consequence. Keep record and prose consistent.
+ESCALATION: an unresolved Nemesis never resets to an earlier baseline. Losses take the specific thing the story took; humiliation is fuel, not a resolution. While they live and the matter is unresolved, never write them broken, resigned, or conceding the player has won.
 ADAPTATION: losing teaches a lesson, not a new power. capabilities lists everything a Nemesis brings beyond ordinary ability; never narrate one matching a capability the story has not shown them acquire. They adapt with what they have — anticipation, ambush, position, distance, traps, numbers — or the story establishes them getting more first. Write concrete means, not "learned to counter him".
 ${returnSectionCompact}${resolutionSection}${knownList}
 No change exactly:
