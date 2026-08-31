@@ -9011,9 +9011,15 @@ function NemesisSystem(hook) {
 
     // Turns a vetoed return waits before it may be offered again.
     const VETO_COOLDOWN = 2;
-    // A return is a REAPPEARANCE, so it requires an actual absence.
-    const MIN_ABSENCE_TURNS = 3;
-    const VERSION = "v0.7.1-alpha";
+    // A return is a REAPPEARANCE, so it requires an actual absence. Six rather
+    // than three because presence can only be detected from the NAME or from a
+    // record write, and a quiet scene supplies neither: a captive sat silently
+    // through three turns of "she" and "the prisoner" with nothing to record,
+    // and was offered a return while tied to a chair. The global return cooldown
+    // is 8 turns, so this costs nothing in practice — it only rules out returns
+    // that the cooldown was going to block anyway.
+    const MIN_ABSENCE_TURNS = 6;
+    const VERSION = "v0.7.2-alpha";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
@@ -9485,8 +9491,14 @@ function NemesisSystem(hook) {
     // return scheduler can never disagree with each other.
     const CONFIRMED_DEAD = /\b(?:confirmed|permanent(?:ly)?|verified|definitely|truly)\s+dead\b|\bconfirmed\s+death\b|\bdead\s*[—-]\s*confirmed\b/i;
     const normalizeSnapshot = snap => {
+        // A corpse has no plans. Death already forced returnState closed, but the
+        // card kept whatever Drive and Urgency it had in life, so a dead Nemesis
+        // read "Status: Confirmed dead / Drive: Hunt the player down / Urgency:
+        // high" — incoherent on the card the player reads, and fed to the model
+        // every time the card triggers. Notes stays editable, so correcting the
+        // Status brings the character back under the player's control.
         if (CONFIRMED_DEAD.test(String(snap?.status || ""))) {
-            return { ...snap, returnState: "closed" };
+            return { ...snap, returnState: "closed", drive: "None established", urgency: "low" };
         }
         return snap;
     };
@@ -9940,7 +9952,15 @@ function NemesisSystem(hook) {
 
     const activeNemeses = cards => {
         const recent = history.slice(-5).map(a => String(a?.text ?? a?.rawText ?? "")).join("\n");
-        return cards.filter(({ snap }) => nameInText(snap.name, recent));
+        // Mentioning a dead Nemesis — standing over the body, naming them, being
+        // asked about them — used to make them "active", which fired encounter
+        // resolution guidance about a corpse ("the scene is over and must move
+        // on"), echoed them as a live participant whose card is authoritative,
+        // and spent context budget on their snapshot. Only confirmed death is
+        // excluded here; a living Nemesis whose rivalry is closed can still be
+        // in a scene that needs resolving.
+        return cards.filter(({ snap }) => nameInText(snap.name, recent)
+            && !CONFIRMED_DEAD.test(String(snap.status || "")));
     };
 
     // -------------------------------------------------------------------------
@@ -9948,9 +9968,16 @@ function NemesisSystem(hook) {
     // -------------------------------------------------------------------------
     const urgencyWeight = u => ({ low: 1, normal: 3, high: 7, extreme: 12 }[u] || 3);
     const pickReturnCandidate = (cards, cfg) => {
-        if (!cfg.allowReturns || cfg.returnChance <= 0) return null;
-        if ((turn() - NS.lastReturnAttempt) < cfg.returnCooldown) return null;
-        if ((Math.random() * 100) >= cfg.returnChance) return null;
+        // Diagnostic only — records WHY no return was offered. "Returns never
+        // happen" is the hardest report to triage without this, because every
+        // gate here fails silently and identically.
+        const no = why => { NS.stages.returnBlocked = why; return null; };
+        NS.stages.returnBlocked = "";
+        if (!cfg.allowReturns || cfg.returnChance <= 0) return no("returns disabled in config");
+        if ((turn() - NS.lastReturnAttempt) < cfg.returnCooldown) {
+            return no(`global cooldown (${cfg.returnCooldown - (turn() - NS.lastReturnAttempt)} turns left)`);
+        }
+        if ((Math.random() * 100) >= cfg.returnChance) return no(`chance roll missed (${cfg.returnChance}%)`);
 
         const recent = history.slice(-5).map(a => String(a?.text ?? a?.rawText ?? "")).join("\n");
         const pool = cards.filter(({ snap }) => {
@@ -9990,7 +10017,11 @@ function NemesisSystem(hook) {
             const staleDormant = snap.returnState === "dormant" && cfg.stalePresentTurns <= unseen;
             return snap.returnState === "eligible" || stalePresent || staleDormant;
         });
-        if (!pool.length) return null;
+        if (!pool.length) {
+            return no(cards.length
+                ? "no eligible candidate (in the scene, on cooldown, dead, closed, or not absent long enough)"
+                : "no Nemesis cards exist yet");
+        }
 
         const total = pool.reduce((n, x) => n + urgencyWeight(x.snap.urgency), 0);
         let r = Math.random() * total;
@@ -10014,27 +10045,6 @@ function NemesisSystem(hook) {
     // -------------------------------------------------------------------------
     const snapshotForPrompt = snap => renderSnapshot(snap).slice(0, 1400);
 
-    const recordFormat = `
-After any Inner Self parenthetical operation, the NEXT text must be this hidden record, followed by normal story prose. Never omit BEGIN or END.
-${START}
-mode: upsert
-name: Darius
-title: One-Eye
-status: Alive
-physical: Missing left eye due to the player
-position: None established
-relationships: The player is a personal enemy; Darius wants revenge
-history: The player destroyed Darius's left eye; Darius escaped alive
-drive: Revenge, but cautious
-return: eligible
-urgency: high
-${END}
-For no qualifying change use exactly:
-${START}
-mode: none
-${END}
-mode is upsert, maintenance, or none. return is present, eligible, dormant, or closed. urgency is low, normal, high, or extreme.
-    `.trim();
 
     const significanceRules = playerRef => `
 A new Nemesis requires a named or uniquely identifiable NPC plus major unresolved
@@ -10180,6 +10190,8 @@ Judge only events already established by narration before the current unresolved
                     ? `>> Position filled from the story: ${s.positionFromStory}` : "",
                 s.historyMerged
                     ? `>> History would have been replaced; kept the earlier event: ${s.historyMerged}` : "",
+                (!s.returnCandidate && s.returnBlocked)
+                    ? `Return not offered: ${s.returnBlocked}` : "",
                 NS.debugRaw ? `\n-- Raw record as received --\n${NS.debugRaw}` : ""
             ].filter(l => l !== "").join("\n");
         } catch {}
@@ -10418,7 +10430,9 @@ position: <role or standing this story gave them, else None established>
 relationships: <what they are to ${playerRef}, and what made it so>
 history: <the whole rivalry so far, compact — every major event, oldest first>
 drive: <what they pursue now, short phrase>
-return: <eligible | dormant | present | closed>
+return: <where they are RIGHT NOW — present = in this scene, including captive,
+  restrained, guarded or unconscious; eligible = they have actually LEFT and may
+  return later; dormant = gone with no reason to recur; closed = permanently over>
 urgency: <low | normal | high>
 ${END}
 
