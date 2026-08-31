@@ -8954,7 +8954,7 @@ function AutoCards(inHook, inText, inStop) {
 // Your other library scripts go here
 
 /**
- * Nemesis Engine v0.1.16-alpha
+ * Nemesis Engine v0.9.4-alpha
  * Companion module for LewdLeah's Inner Self v1.0.2 / AI Dungeon.
  *
  * DESIGN GOALS
@@ -8990,7 +8990,9 @@ function NemesisSystem(hook) {
         autoRegisterInnerSelf: true,
         allowReturns: true,
         survivalGuidance: true,
-        returnChance: 12,              // % per eligible context turn
+        returnChance: 12,
+        allowRivalries: true,          // may two Nemeses collide with each other
+        rivalryChance: 8,              // chance per eligible turn of offering one              // % per eligible context turn
         returnCooldown: 8,             // turns between global return attempts
         sameNemesisCooldown: 16,       // turns between attempts for the same Nemesis
         stalePresentTurns: 10,         // if not mentioned this long, "present" can become returnable
@@ -9011,6 +9013,13 @@ function NemesisSystem(hook) {
 
     // Turns a vetoed return waits before it may be offered again.
     const VETO_COOLDOWN = 2;
+    // Rivalry events: how often the script may offer two Nemeses a collision, and
+    // how long it waits afterwards. The tiers escalate in rarity — most offers
+    // are just a crossing of paths; one of them actually dying is rare, because
+    // it permanently removes a rivalry the player built.
+    const RIVALRY_COOLDOWN = 12;
+    const RIVALRY_IN_PLAY = 6;
+
     // A return is a REAPPEARANCE, so it requires an actual absence. Six rather
     // than three because presence can only be detected from the NAME or from a
     // record write, and a quiet scene supplies neither: a captive sat silently
@@ -9019,7 +9028,7 @@ function NemesisSystem(hook) {
     // is 8 turns, so this costs nothing in practice — it only rules out returns
     // that the cooldown was going to block anyway.
     const MIN_ABSENCE_TURNS = 6;
-    const VERSION = "v0.8.1-alpha";
+    const VERSION = "v0.9.4-alpha";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
@@ -9089,11 +9098,11 @@ function NemesisSystem(hook) {
     // Position needs a baseline or "promotion" has nothing to measure from. The
     // prompt asks the model for a plain established role; this is the backstop
     // for when it does not comply. It reads ONLY appositives that bind a common
-    // noun directly to the name — "a ganger named Rico", "Rico, a fixer" — which
-    // is parsing, not inference. Anything looser is left to the model.
+    // noun directly to the name — "a guard named <Name>", "<Name>, a healer" —
+    // which is parsing, not inference. Anything looser is left to the model.
     //
     // Words that describe a person without being a role. A story that says
-    // "a man named Rico" has established nothing about his standing.
+    // "a man named <Name>" has established nothing about their standing.
     const ROLE_STOPWORDS = new Set([
         "man", "men", "woman", "women", "guy", "guys", "girl", "girls", "boy",
         "boys", "kid", "kids", "person", "people", "figure", "figures", "stranger",
@@ -9105,11 +9114,11 @@ function NemesisSystem(hook) {
         "angry", "injured", "wounded", "bleeding", "familiar", "unfamiliar",
         "certain", "particular", "second", "third", "male", "female",
         // Connectives that must never survive as a head noun. Without these,
-        // "a man named Rico" trims the generic "man" and yields "Named".
+        // "a man named <Name>" trims the generic "man" and yields "Named".
         "named", "called", "known", "goes", "by", "of", "the", "a", "an"
     ]);
-    // Leading modifiers get trimmed rather than rejected: "the young ganger Rico"
-    // still establishes "ganger".
+    // Leading modifiers get trimmed rather than rejected: "the young guard
+    // <Name>" still establishes "guard".
     const isRoleWord = w => /^[a-z][a-z'-]{1,}$/i.test(w) && !ROLE_STOPWORDS.has(w.toLowerCase());
     const tidyRole = (phrase = "") => {
         let words = normalize(phrase).toLowerCase()
@@ -9128,17 +9137,17 @@ function NemesisSystem(hook) {
         if (!who) return "";
         const src = normalize(String(source || "")).replace(/\n+/g, " ");
         const patterns = [
-            // "a ganger named Rico" / "an ex-cop called Rico"
+            // "a guard named <Name>" / "an outrider called <Name>"
             new RegExp(`\\b(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s+(?:named|called)\\s+${who}\\b`, "i"),
-            // "Rico, a ganger," / "Rico — the fixer."
+            // "<Name>, a guard," / "<Name> — the healer."
             new RegExp(`\\b${who}\\b\\s*[,—-]\\s*(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s*(?:[,.;—]|\\band\\b|$)`, "i"),
-            // "the ganger Rico"
+            // "the guard <Name>"
             new RegExp(`\\b(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s+${who}\\b`, "i")
         ];
         for (const re of patterns) {
             const m = src.match(re);
             if (!m) continue;
-            // A pattern that matches OWNS the verdict. "A man named Rico" matches
+            // A pattern that matches OWNS the verdict. "A man named <Name>" matches
             // the first pattern and yields nothing — falling through to a looser
             // pattern on the same sentence is how "man named" became "Named".
             const role = tidyRole(m[1]);
@@ -9292,7 +9301,77 @@ function NemesisSystem(hook) {
         const lines = card.description.split("\n").map(x => cleanName(x));
         if (lines.some(x => x.toLowerCase() === cleaned.toLowerCase())) return true;
         card.description = `${card.description.trimEnd()}\n${cleaned}\n`;
+        // Record that WE added this one. Ownership is the whole safety condition
+        // for removing it later: a name the player typed in themselves, or one a
+        // scenario shipped with, must never be touched by us.
+        NS.registered ??= {};
+        NS.registered[cleaned] = true;
         return true;
+    };
+
+    // Deleting a Nemesis card used to leave its Inner Self registration behind,
+    // so a character the player had removed kept generating thoughts forever with
+    // nothing left to attach them to. Reconcile once per turn: drop only the
+    // names we added whose card no longer exists.
+    const unregisterOrphanedAgents = () => {
+        const owned = Object.keys(NS.registered || {});
+        if (!owned.length) return;
+        // Only when BOTH are gone. Inner Self rebuilds its agent list from the
+        // brain cards it owns, so removing a name while the brain still exists
+        // is undone on the very next output hook — we would rewrite that card
+        // every turn, forever, and never win. The brain is Inner Self's data;
+        // Nemesis mirrors Inner Self rather than reaching into it.
+        const hasBrain = name => {
+            const n = cleanName(name).toLowerCase();
+            return storyCards.some(c => !isNemesisCard(c)
+                && normalize(c?.title || "").toLowerCase().includes(n));
+        };
+        const orphans = owned.filter(name => !findNemesisCard(name) && !hasBrain(name));
+        if (!orphans.length) return;
+        const card = findInnerSelfConfig();
+        if (!card || typeof card.description !== "string") {
+            for (const name of orphans) delete NS.registered[name];
+            return;
+        }
+        const drop = new Set(orphans.map(n => n.toLowerCase()));
+        const kept = card.description.split("\n")
+            .filter(line => !drop.has(cleanName(line).toLowerCase()));
+        const removed = [];
+        for (const name of orphans) {
+            delete NS.registered[name];
+            delete NS.cards[name];
+            delete NS.lastSeen[name];
+            removed.push(name);
+        }
+        if (kept.length !== card.description.split("\n").length) {
+            card.description = `${kept.join("\n").trimEnd()}\n`;
+        }
+        NS.stages.unregistered = removed.join(", ");
+    };
+
+    // The other half of the same reconciliation. Registration used to happen
+    // once, at card creation, which is wrong the moment a card's name changes
+    // by any route other than creation. Renaming a card by hand is the ordinary
+    // one — a player names an NPC the story had only described, retitles the
+    // card to match, and the Nemesis side then works perfectly while Inner Self
+    // still has an agent under the OLD name and none under the new one. The
+    // character quietly stops having thoughts, and nothing reports it.
+    //
+    // Deliberately narrow. A name already in NS.registered is one WE added, so
+    // if it is missing from Inner Self's list now the player took it out on
+    // purpose and it stays out — re-adding it every turn is the exact fight
+    // with Inner Self that the un-register path had to be rewritten to avoid.
+    // Only names we have never registered are considered.
+    const registerUnknownAgents = (cards, cfg) => {
+        if (!cfg?.autoRegisterInnerSelf) return;
+        NS.registered ??= {};
+        const added = [];
+        for (const { snap } of cards || []) {
+            const name = cleanName(snap?.name || "");
+            if (!name || NS.registered[name]) continue;
+            if (registerWithInnerSelf(name) && NS.registered[name]) added.push(name);
+        }
+        if (added.length) NS.stages.registered = added.join(", ");
     };
 
     // -------------------------------------------------------------------------
@@ -9389,6 +9468,8 @@ function NemesisSystem(hook) {
             autoDiscover: parseBool(read("Automatic discovery"), DEFAULTS.autoDiscover),
             autoRegisterInnerSelf: parseBool(read("Auto-register Nemeses with Inner Self"), DEFAULTS.autoRegisterInnerSelf),
             allowReturns: parseBool(read("Allow return events"), DEFAULTS.allowReturns),
+            allowRivalries: parseBool(read("Allow rivalries between Nemeses"), DEFAULTS.allowRivalries),
+            rivalryChance: parseIntField(read("Rivalry event chance"), DEFAULTS.rivalryChance, 0, 100),
             survivalGuidance: parseBool(read("Allow survival and retreat guidance"), DEFAULTS.survivalGuidance),
             returnChance: parseIntField(read("Return opportunity chance"), DEFAULTS.returnChance, 0, 100),
             returnCooldown: parseIntField(read("Turns between return attempts"), DEFAULTS.returnCooldown, 0, 999),
@@ -9413,6 +9494,8 @@ function NemesisSystem(hook) {
             `Auto-register Nemeses with Inner Self: ${cfg.autoRegisterInnerSelf}`,
             `Player name: "${player === "the protagonist" ? "Example" : player}"`,
             `Allow return events: ${cfg.allowReturns}`,
+            `Allow rivalries between Nemeses: ${cfg.allowRivalries}`,
+            `Rivalry event chance: ${cfg.rivalryChance}%`,
             `Allow survival and retreat guidance: ${cfg.survivalGuidance}`,
             `Return opportunity chance: ${cfg.returnChance}%`,
             `Turns between return attempts: ${cfg.returnCooldown}`,
@@ -9607,11 +9690,67 @@ function NemesisSystem(hook) {
         const n = cleanName(raw);
         if (!n) return true;
         const article = n.match(/^(?:the|a|an)\s+(.+)$/i);
-        // After an article, a proper name keeps its capital. All-lowercase means
-        // the model wrote a description rather than naming anyone.
-        if (article) return article[1] === article[1].toLowerCase();
-        // A bare generic person-noun is never an identity.
-        return n.split(/\s+/).length === 1 && ROLE_STOPWORDS.has(n.toLowerCase());
+        const core = article ? article[1] : n;
+        // A proper name keeps a capital somewhere, with or without an article.
+        // Two or more words and not one capital between them is a description
+        // the model wrote instead of naming anyone: reported live as a card
+        // titled "feral devil spider", which the player then had to rename by
+        // hand. Rejecting costs nothing — the analysis hash is not committed,
+        // so the next qualifying turn asks for a name again.
+        if (core.split(/\s+/).length > 1 && core === core.toLowerCase()) return true;
+        // After an article, a lowercase single word is the same mistake in
+        // miniature: "the guard" labels a role, it does not name a person.
+        if (article) return core === core.toLowerCase();
+        // A single lowercase word is left alone — stories do stylise names that
+        // way — unless it is a bare generic person-noun, which is never an
+        // identity.
+        if (n.split(/\s+/).length === 1 && ROLE_STOPWORDS.has(n.toLowerCase())) return true;
+        // ROLE_STOPWORDS is the wrong list for the rest: it holds words that are
+        // NOT roles, because its job is to stop "a man named X" yielding a
+        // position. "guard" is a real role, so it cannot go in there without
+        // breaking that, and a list of every role in every genre would be both
+        // endless and steeped in one setting's vocabulary.
+        //
+        // So ask the story instead. A single lowercase word that the prose
+        // itself introduces with an article — "the guard", "a scavenger" — is a
+        // label the story applied, not a name it gave. That is parsing, not
+        // inference, it needs no word list, and it stays neutral across
+        // settings. A name the story writes without an article is left alone.
+        if (n === n.toLowerCase()) {
+            try {
+                const article = new RegExp(`\\b(?:the|a|an)\\s+${escapeRegExp(n)}\\b`, "i");
+                if (article.test(storyText())) return true;
+            } catch {}
+        }
+        return false;
+    };
+
+    // status is an enum the prompt states, but the model can write anything and
+    // whatever it writes becomes sticky continuity — the card shows it back on
+    // every later turn. A live run produced "Status: captive", which would have
+    // stayed on the card long after the captivity ended, because a value the
+    // schema never had has no natural transition out of it. Captivity is a
+    // RETURN state ("present"), not a status, and the record already said so.
+    //
+    // The rule is: rewrite only where the intent is unambiguous, and never
+    // rewrite away from death. Un-killing an NPC the story killed is far worse
+    // than an untidy status, so anything mentioning death is kept verbatim and
+    // CONFIRMED_DEAD keeps sole ownership of the closing case.
+    const STATUS_VALUES = ["Alive", "Injured", "Missing", "Confirmed dead"];
+    const normalizeStatus = (raw, fallback) => {
+        const s = normalize(String(raw || "")).trim();
+        if (!s) return fallback;
+        const exact = STATUS_VALUES.find(v => v.toLowerCase() === s.toLowerCase());
+        if (exact) return exact;
+        if (CONFIRMED_DEAD.test(s)) return "Confirmed dead";
+        if (/\b(?:dead|dying|deceased|killed|slain|corpse)\b/i.test(s)) return s;
+        if (/\b(?:injur\w*|wound\w*|maim\w*|crippl\w*|mangled|bleeding)\b/i.test(s)) return "Injured";
+        if (/\b(?:missing|vanished|disappeared|unaccounted)\b/i.test(s)) return "Missing";
+        if (/\b(?:alive|unharmed|uninjured|healthy|intact)\b/i.test(s)) return "Alive";
+        // Not a status at all — "captive", "recruit", "recovering". Keep what
+        // the card already had and surface the discarded value in debug.
+        try { NS.stages.discardedStatus = s; } catch {}
+        return fallback;
     };
 
     const upsertNemesis = (snap, cfg) => {
@@ -9723,22 +9862,45 @@ function NemesisSystem(hook) {
     // Accepted-history fingerprint. Do/Say at the newest edge are attempts, not outcomes.
     // Story actions are treated as canonical because Story mode directly authors narration.
     // -------------------------------------------------------------------------
-    const acceptedHistory = () => {
-        const arr = history.slice(-8).map(a => ({
+    // Trailing Do/Say entries are the player's CURRENT unresolved attempt, not
+    // something the story has established, so every window drops them.
+    const acceptedWindow = limit => {
+        const arr = history.slice(-limit).map(a => ({
             type: String(a?.type || ""),
             text: String(a?.text ?? a?.rawText ?? "")
         }));
         while (arr.length && ["do", "say"].includes(arr[arr.length - 1].type)) arr.pop();
         return arr;
     };
+    // Change detection only needs to know whether the recent story moved, so a
+    // small window is right here and keeps the hash cheap.
+    const acceptedHistory = () => acceptedWindow(8);
     const acceptedHash = () => simpleHash(acceptedHistory().map(a => `${a.type}:${a.text}`).join("\n\u241E\n"));
     const recentAcceptedText = () => acceptedHistory().slice(-3).map(a => a.text).join("\n\n").slice(-1200);
-    // A fact the story established stays established. The 3-action window above
-    // is right for "what just happened"; it is wrong for "has this ever been
-    // stated", which is what grounding a role or checking whether a detail was
-    // invented actually asks. An NPC introduced as a ganger five turns ago was
-    // still introduced as a ganger.
-    const storyText = () => acceptedHistory().map(a => a.text).join("\n\n").slice(-20000);
+
+    // "HAS THIS EVER BEEN STATED" IS A DIFFERENT QUESTION FROM "WHAT JUST
+    // HAPPENED", and it needs a different window. Grounding a role, or checking
+    // whether a detail was invented, asks about the whole story; a fact the
+    // story established stays established.
+    //
+    // This used to be built from acceptedHistory(), which is capped at EIGHT
+    // history entries \u2014 roughly four turns. The comment here claimed the whole
+    // story and the code delivered four turns, so an NPC introduced as a guard
+    // twenty turns ago had no findable role, and a detail established ten turns
+    // ago read as unsupported. A live debug dump showed it plainly: history 124,
+    // accepted actions 7.
+    //
+    // Memoised per turn because three separate callers ask for it and the join
+    // is over the whole window.
+    const STORY_WINDOW = 120, STORY_CHARS = 20000;
+    let storyTextCache = { key: "", value: "" };
+    const storyText = () => {
+        const key = `${history.length}:${turn()}`;
+        if (storyTextCache.key === key) return storyTextCache.value;
+        const value = acceptedWindow(STORY_WINDOW).map(a => a.text).join("\n\n").slice(-STORY_CHARS);
+        storyTextCache = { key, value };
+        return value;
+    };
 
     // -------------------------------------------------------------------------
     // Hidden record parser. Complete snapshots replace current snapshot fields.
@@ -10060,6 +10222,53 @@ function NemesisSystem(hook) {
     };
 
     // -------------------------------------------------------------------------
+    // Rivalry events. Two Nemeses can have history with each other, not only with
+    // the player — which is also the only way "standing earned against someone
+    // who is not the player" ever gets a chance to happen.
+    //
+    // This offers an OPPORTUNITY and never an outcome. The script picks the pair
+    // and the tier; the model narrates it and writes both records in the SAME
+    // generation, so the two cards cannot contradict each other, or it vetoes the
+    // whole thing as implausible and nothing changes. No card in this system is
+    // ever written except from a model record, so a rivalry cannot resolve
+    // off-page: if it is not narrated, it did not happen.
+    // -------------------------------------------------------------------------
+    const pickRivalryEvent = (cards, cfg) => {
+        if (!cfg.allowRivalries || cfg.rivalryChance <= 0) return null;
+        if ((turn() - (NS.lastRivalryAttempt ?? -999999)) < RIVALRY_COOLDOWN) return null;
+        const living = cards.filter(({ snap }) =>
+            !CONFIRMED_DEAD.test(String(snap.status || ""))
+            && String(snap.returnState).toLowerCase() !== "closed");
+        if (living.length < 2) return null;
+        if ((Math.random() * 100) >= cfg.rivalryChance) return null;
+
+        // The player must have a route to find out. At least one of the two has
+        // to be in play, so the story has a natural vehicle — witnessed, carried
+        // as news, or shown by the one who walks back in changed. Without that
+        // there is no way for the player to learn, and a card that changes for
+        // reasons the player can never reach is exactly the incoherence this
+        // system exists to avoid.
+        const recent = history.slice(-5).map(a => String(a?.text ?? a?.rawText ?? "")).join("\n");
+        const inPlay = living.filter(({ snap }) => nameInText(snap.name, recent)
+            || (turn() - (NS.lastSeen[snap.name] ?? -999999)) <= RIVALRY_IN_PLAY);
+        if (!inPlay.length) return null;
+
+        const near = inPlay[Math.floor(Math.random() * inPlay.length)];
+        const others = living.filter(({ snap }) => snap.name !== near.snap.name);
+        if (!others.length) return null;
+        const other = others[Math.floor(Math.random() * others.length)];
+
+        // Escalating rarity. Killing removes a rivalry the player invested in, so
+        // it is the rarest thing the script will ever propose.
+        const roll = Math.random();
+        const tier = roll < 0.12 ? "kill" : roll < 0.40 ? "prevail" : "cross";
+
+        NS.lastRivalryAttempt = turn();
+        NS.stages.rivalryOffer = `${near.snap.name} / ${other.snap.name} (${tier})`;
+        return { a: near.snap, b: other.snap, tier };
+    };
+
+    // -------------------------------------------------------------------------
     // Context prompt builders.
     // -------------------------------------------------------------------------
     const snapshotForPrompt = snap => renderSnapshot(snap).slice(0, 1400);
@@ -10085,7 +10294,7 @@ crippling they survive is sufficient by itself; do not wait for a revenge speech
 THEY HARMED ${playerRef}: beat them in a fight, put them down, disarmed or robbed
 them, wounded or nearly killed them, humiliated them, or walked away the clear
 winner. This is EQUALLY sufficient by itself — an enemy who WINS is exactly the
-kind worth remembering, and does NOT need to be injured by the player first in
+kind worth remembering, and does NOT need to be injured by ${playerRef} first in
 order to qualify. Do not wait for ${playerRef} to hurt them back.
 
 EITHER DIRECTION: major betrayal, credible personal death threat, explicit
@@ -10184,7 +10393,8 @@ Judge only events already established by narration before the current unresolved
                 `Task variant: ${c.task || "none"}`,
                 `Task chars: ${d.taskChars ?? 0}`,
                 `Task present in final Context text: ${d.taskPresent ? "YES" : "NO"}`,
-                `Strict SYSTEM task present: ${d.strictSystem ? "YES" : "NO"}`,
+                `Task wrapped in <SYSTEM>: ${d.systemWrapped ? "YES" : "NO"}`,
+                `Story window: ${d.storyWindowChars ?? "?"} chars from ${d.storyWindowActions ?? "?"} actions (grounding)`,
                 `Context chars: ${d.contextBefore ?? "?"} -> ${d.contextAfter ?? "?"}`,
                 `Room: ${c.roomBefore ?? "?"} -> ${c.roomAfter ?? "?"} | story trimmed: ${c.trimmed || 0}`,
                 `Expected record entering Output: ${d.expectAtOutput ? "YES" : "NO"}`,
@@ -10220,6 +10430,12 @@ Judge only events already established by narration before the current unresolved
                     ? `!! Rejected as a name (that is a description, not a person): "${s.rejectedName}"` : "",
                 s.nameNotInProse
                     ? `!! "${s.nameNotInProse}" was named in the record but never in the story text.\n   Nothing can trigger that card until the name appears in the prose.` : "",
+                s.unregistered
+                    ? `>> Card deleted; also un-registered from Inner Self: ${s.unregistered}` : "",
+                s.registered
+                    ? `>> Registered with Inner Self (card existed but the name was not listed): ${s.registered}` : "",
+                s.discardedStatus
+                    ? `!! Status "${s.discardedStatus}" is not one of Alive / Injured / Missing / Confirmed dead,\n   so the previous status was kept. Captivity belongs in Return: present.` : "",
                 (!s.returnCandidate && s.returnBlocked)
                     ? `Return not offered: ${s.returnBlocked}` : "",
                 NS.debugRaw ? `\n-- Raw record as received --\n${NS.debugRaw}` : ""
@@ -10280,15 +10496,23 @@ Judge only events already established by narration before the current unresolved
 
         const cards = nemesisCards();
         updateLastSeen(cards);
+        unregisterOrphanedAgents();
+        registerUnknownAgents(cards, cfg);
         const active = activeNemeses(cards);
         const currentHash = acceptedHash();
         const needsAnalysis = !!(cfg.autoDiscover && currentHash && currentHash !== NS.lastAnalysisHash);
         NS.diagnostic.acceptedCount = acceptedHistory().length;
+        // The grounding window is separate from the change-detection window and
+        // very much larger. Reporting both stops the small one being mistaken
+        // for all the story the script can see.
+        NS.diagnostic.storyWindowChars = storyText().length;
+        NS.diagnostic.storyWindowActions = acceptedWindow(STORY_WINDOW).length;
         NS.diagnostic.currentHash = currentHash;
         NS.diagnostic.lastHash = NS.lastAnalysisHash || "";
         NS.diagnostic.needsAnalysis = needsAnalysis;
         const maintenance = maintenanceTarget(cards, cfg);
         const returnCandidate = pickReturnCandidate(cards, cfg);
+        const rivalry = pickRivalryEvent(cards, cfg);
 
         const survival = cfg.survivalGuidance ? `
 <NEMESIS-SURVIVAL-GUIDANCE>
@@ -10319,6 +10543,28 @@ Named recurring opponents need not fight to the death. According to personality,
         const stanceNote = (returnCandidate && (stanceAge >= 5 || stanceSkipped >= 1))
             ? `\nSTANCE AGE: drive/relationships/urgency have not changed for ${stanceAge} accepted turns${stanceSkipped ? `, across ${stanceSkipped} update(s) that changed other fields` : ""}. Check whether they still describe ${rc}.`
             : "";
+        const rivalrySection = rivalry ? `
+## RIVALRY — ${rivalry.a.name} and ${rivalry.b.name}
+These two both have unfinished business with ${playerRef}, and that does not make
+them allies. If the story can plausibly bring their paths together now, do it:
+${rivalry.tier === "kill"
+    ? `this is the rare one — it may end with one of them dead at the other's hand.`
+    : rivalry.tier === "prevail"
+    ? `one of them may come out of it on top, without either dying.`
+    : `they cross, and it need not settle anything — a threat, a warning, a refusal, a bargain.`}
+${playerRef} must have a way to learn of it: shown on the page, found afterwards,
+carried as news, or visible on whichever of them next appears. Never resolve it
+somewhere ${playerRef} can neither see nor hear about.
+Whatever happens, record BOTH of them in this same response — two records, one
+for each — so their cards agree. What the winner takes (people, ground, gear,
+standing) is theirs now; what the loser lost is gone. Each card's history is
+still cumulative and still theirs: add what happened between them to what each
+already records about ${playerRef}; never swap one rivalry out for the other. If
+bringing them together
+would strain what the story has established, ignore this entirely and write the
+scene normally.
+` : "";
+
         const returnSectionFull = returnCandidate ? `
 ## RETURN OPPORTUNITY — ${rc}
 ${snapshotForPrompt(returnCandidate.snap)}
@@ -10421,27 +10667,95 @@ story supports it. A reaction — shock, panic, fresh rage, staying alive right 
 
 `;
 
-        const recordTask = shouldRequestRecord ? `
-<SYSTEM>
-# NEMESIS SYSTEM
-## OUTPUT ORDER — REQUIRED
-1. If an earlier Inner Self SYSTEM instruction requires a parenthetical brain operation, output it first exactly as Inner Self requires, followed by one space.
-2. Then exactly one SHORT Nemesis record, beginning ${START} and ending ${END}.
-3. Immediately after ${END}, continue the story prose, which must be the majority of the response.
-4. Do not explain the record and put no other prose before it.
+        const outcomeSection = `OUTCOME DRIVERS — what an encounter changes about them
+- They survive being hurt -> physical records the lasting mark.
+- They LOSE, are beaten, spared, or humiliated -> capabilities records what they
+  change in response, as a CONCRETE method rather than a claim to have solved
+  the problem. Losing teaches preparation: equipment they went and got, help
+  they did not bring last time, ground they choose, a trap, an ambush, or
+  refusing a fight they cannot win. A Nemesis who loses and adapts is the point
+  of the system.
+- They WIN — beat ${playerRef}, put them down, take something from them, or walk
+  away on top -> history records the win plainly: what they did to ${playerRef} and
+  what it cost him, in the story's own terms. If the story also establishes that
+  the win changed how others treat them, position and title rise. The win is
+  recorded whether or not anyone noticed it.
+- They return after an absence -> new gear, allies or methods go in capabilities.
+  physical is only ever their body.
+- They beat, break or kill someone who is NOT ${playerRef} -> what they took from
+  that fight is theirs now: the other side's people, ground, gear or standing.
+  Record it, and let position or title rise if the story shows others treating
+  them differently for it. Standing can be earned against anyone.
+Apply these only where the story establishes the outcome. An encounter ${playerRef}
+walked away from unchanged changes nothing.
 
-## NEMESIS DECISION
-${significanceRules(playerRef)}
-- Use the CURRENT player Do/Say action only if the continuation you are about to write will establish that consequence as canon. Decide that outcome first; if the action fails or creates no qualifying development, do not record it. Record and continuation must never contradict each other.
-- Upserts are complete snapshots: preserve still-true facts, replace superseded ones.
-- ${existingForAnalysis}
-${maintenancePrompt}
+`;
+        const escalationSection = `UNRESOLVED NEMESES ESCALATE, THEY DO NOT RESET
+Defeat, humiliation, injury, a failed plan or a lost resource never returns a
+Nemesis to an earlier baseline. The story may take the SPECIFIC thing it actually
+took — an ally killed, equipment destroyed, ground lost, a wound that impairs
+them — and they answer that loss by adapting again in a new direction: different
+allies, better preparation, traps, patience, leverage, indirect attacks, a
+changed objective, or striking at what ${playerRef} values instead of at him.
+Humiliation is fuel, not a resolution; it usually intensifies or twists a
+rivalry. While they live and the matter between them is unresolved, do
+not write them broken, resigned, or conceding that ${playerRef} has won. A low
+point is part of an arc, not the end of one. Only an outcome the story genuinely
+establishes closes a rivalry.
 
-${returnSectionFull}${resolutionSection}
-## EXACT RECORD SHAPE
-${knownList}
+`;
+        const adaptationSection = `ADAPTATION MUST RESPECT ESTABLISHED CAPABILITY
+capabilities is the whole list of what a Nemesis brings beyond ordinary ability.
+Losing teaches a lesson, and a lesson is not a new power. Adaptation by itself
+never grants strength, speed, senses, skill, knowledge, equipment, magic, wealth,
+rank or allies. If countering what beat them needs something they lack, the story
+must first establish them getting it — training, gear, a patron, an ally, study,
+whatever this setting allows. Until then they adapt with what they have:
+anticipation, ambush, position, distance, traps, numbers, changing the objective,
+exploiting a habit, or refusing that fight. Knowing WHAT beat them is not the
+ability to answer it, and a Nemesis never breaks this setting's rules to stay
+dangerous.
 
-Angle brackets below describe what belongs on the line. They are instructions,
+`;
+        const smallestSection = `WRITE THE SMALLEST TRUE VERSION
+When the story supports a simple version and a richer one, write the simple one.
+A field that says LESS than you could infer is correct; a field that says more
+than the story showed is a fabrication, however plausible. The commonest
+fabrications are motives nobody stated and equipment nobody showed, and "None
+established" is often the right answer. Two real failures, described rather than
+written out because a written-out record gets reused as continuity:
+`;
+        const fieldSection = `FIELD DISCIPLINE
+- physical: lasting bodily facts the scene established — injuries, stiffness,
+  limps, walking aids, replacements for what they lost. ADD new detail rather
+  than dropping it. Narration that only wonders or speculates establishes
+  nothing. Record the injury at the severity shown, not the diagnosis it
+  implies: a hard blow, a bad sound and blood establish severe trauma there,
+  not which bone broke.
+- drive: an ongoing motivation as a short phrase — the motive and what they are
+  doing about it, not the motive and a bare tactic word.
+- capabilities: what they can bring to bear now that they could not before —
+  equipment, allies, tactics learned from losing. Not their body, not their
+  rank. Concrete means, never abstract competence: "keeps distance and attacks
+  from cover" or "brought two of his people", never "learned to counter him",
+  which lets a later scene invent whatever ability that would take.
+- position: their standing, the one field tracking where they RANK, so it needs
+  a starting point. Record the plain role the story gave them the first time it
+  gives it, ordinary though it is: a guard, a thief, a servant, a healer — that
+  IS their position. Replace it when they rise or fall; the old standing lives
+  on in history. "None established" only where the story genuinely has not said.
+  Never upgrade a plain role into a rank, attach a faction never named, or
+  record standing they are only being offered, taken toward, or considered for.
+- relationships: name the relationship and what changed it, in a phrase.
+- history: CUMULATIVE, and the only field that is — the whole rivalry, not the
+  latest turn. Carry every major event already recorded and add the new one,
+  oldest first. NEVER replace a past event with the current one: a defeat,
+  victory, betrayal, maiming or sparing is permanent and stays even after it is
+  avenged. Compress old entries as the line grows; losing wording is fine,
+  losing an event is not.
+
+`;
+        const recordShapeSection = `Angle brackets below describe what belongs on the line. They are instructions,
 never values. Never write a bracket into a record.
 
 A) NEW Nemesis — a name with no card yet. Give the full initial state:
@@ -10474,97 +10788,8 @@ name: <the same name as their existing card>
 <another field that changed this turn>: <its new value>
 ${END}
 
-OUTCOME DRIVERS — what an encounter changes about them
-- They survive being hurt -> physical records the lasting mark.
-- They LOSE, are beaten, spared, or humiliated -> capabilities records what they
-  change in response, as a CONCRETE method rather than a claim to have solved
-  the problem. Losing teaches preparation: equipment they went and got, help
-  they did not bring last time, ground they choose, a trap, an ambush, or
-  refusing a fight they cannot win. A Nemesis who loses and adapts is the point
-  of the system.
-- They WIN — beat ${playerRef}, put them down, take something from them, or walk
-  away on top -> history records the win plainly: what they did to ${playerRef} and
-  what it cost him, in the story's own terms. If the story also establishes that
-  the win changed how others treat them, position and title rise. The win is
-  recorded whether or not anyone noticed it.
-- They return after an absence -> new gear, allies or methods go in capabilities.
-  physical is only ever their body.
-Apply these only where the story establishes the outcome. An encounter ${playerRef}
-walked away from unchanged changes nothing.
-
-UNRESOLVED NEMESES ESCALATE, THEY DO NOT RESET
-Defeat, humiliation, injury, a failed plan or a lost resource never returns a
-Nemesis to an earlier baseline. The story may take the SPECIFIC thing it actually
-took — an ally killed, equipment destroyed, ground lost, a wound that impairs
-them — and they answer that loss by adapting again in a new direction: different
-allies, better preparation, traps, patience, leverage, indirect attacks, a
-changed objective, or striking at what ${playerRef} values instead of at him.
-Humiliation is fuel, not a resolution; it usually intensifies or twists a
-rivalry. While they live and the matter between them is unresolved, do
-not write them broken, resigned, or conceding that ${playerRef} has won. A low
-point is part of an arc, not the end of one. Only an outcome the story genuinely
-establishes closes a rivalry.
-
-ADAPTATION MUST RESPECT ESTABLISHED CAPABILITY
-capabilities is the whole list of what a Nemesis brings beyond ordinary ability.
-Losing teaches a lesson, and a lesson is not a new power. Adaptation by itself
-never grants strength, speed, senses, skill, knowledge, equipment, magic, wealth,
-rank or allies. If countering what beat them needs something they lack, the story
-must first establish them getting it — training, gear, a patron, an ally, study,
-whatever this setting allows. Until then they adapt with what they have:
-anticipation, ambush, position, distance, traps, numbers, changing the objective,
-exploiting a habit, or refusing that fight. Knowing WHAT beat them is not the
-ability to answer it, and a Nemesis never breaks this setting's rules to stay
-dangerous.
-
-${namedPlayer ? `NAME THE PLAYER. The player character is called ${playerRef}. Write that
-name in record values — "${playerRef} is a personal enemy", not "the player is a
-personal enemy". Never write "the player" or "the protagonist" as a stand-in for
-a character who has a name.\n` : ""}
-WRITE THE SMALLEST TRUE VERSION
-When the story supports a simple version and a richer one, write the simple one.
-A field that says LESS than you could infer is correct; a field that says more
-than the story showed is a fabrication, however plausible. The commonest
-fabrications are motives nobody stated and equipment nobody showed, and "None
-established" is often the right answer. Two real failures, described rather than
-written out because a written-out record gets reused as continuity:
-${calibrationSection}
-FIELD DISCIPLINE
-- physical: lasting bodily facts the scene established — injuries, stiffness,
-  limps, walking aids, replacements for what they lost. ADD new detail rather
-  than dropping it. Narration that only wonders or speculates establishes
-  nothing. Record the injury at the severity shown, not the diagnosis it
-  implies: a hard blow, a bad sound and blood establish severe trauma there,
-  not which bone broke.
-- drive: an ongoing motivation as a short phrase — the motive and what they are
-  doing about it, not the motive and a bare tactic word.
-- capabilities: what they can bring to bear now that they could not before —
-  equipment, allies, tactics learned from losing. Not their body, not their
-  rank. Concrete means, never abstract competence: "keeps distance and attacks
-  from cover" or "brought two of his people", never "learned to counter him",
-  which lets a later scene invent whatever ability that would take.
-- position: their standing, the one field tracking where they RANK, so it needs
-  a starting point. Record the plain role the story gave them the first time it
-  gives it, ordinary though it is: a guard, a thief, a servant, a healer — that
-  IS their position. Replace it when they rise or fall; the old standing lives
-  on in history. "None established" only where the story genuinely has not said.
-  Never upgrade a plain role into a rank or attach a faction never named.
-- relationships: name the relationship and what changed it, in a phrase.
-- history: CUMULATIVE, and the only field that is — the whole rivalry, not the
-  latest turn. Carry every major event already recorded and add the new one,
-  oldest first. NEVER replace a past event with the current one: a defeat,
-  victory, betrayal, maiming or sparing is permanent and stays even after it is
-  avenged. Compress old entries as the line grows; losing wording is fine,
-  losing an event is not.
-
-${stanceSection}After losing a confrontation, a typical delta is capabilities alone:
-${START}
-mode: upsert
-name: <their name>
-capabilities: <what they added in response to losing>
-${END}
-
-Update History only when the cause of a change needs recording. A status change
+`;
+        const deltaExampleSection = `Update History only when the cause of a change needs recording. A status change
 needs only the name and the new status:
 ${START}
 mode: upsert
@@ -10572,7 +10797,226 @@ name: <their name>
 status: Confirmed dead
 ${END}
 
-For no qualifying change, output exactly:
+`;
+        // ── Brief forms of the teaching blocks ──────────────────────────────
+        // Each keeps its heading and every rule its full form states, and pays
+        // for the space by dropping the worked examples and the second way of
+        // saying a thing. They exist so a smaller budget costs detail rather
+        // than costing whole rules. See the reduction ladder below.
+        const outcomeBrief = `OUTCOME DRIVERS — what an encounter changes about them
+- Hurt and survived -> physical records the lasting mark.
+- LOST, beaten, spared or humiliated -> capabilities records the CONCRETE method
+  they change to: gear they went and got, help they did not bring last time,
+  ground they choose, a trap, an ambush, or refusing a fight they cannot win.
+  Never a claim to have solved the problem.
+- WON against ${playerRef} -> history records the win plainly: what they did and
+  what it cost him. position and title rise only where the story shows others
+  treating them differently for it.
+- Returned after an absence -> new gear, allies or methods go in capabilities.
+  physical is only ever their body.
+- Beat, broke or killed someone who is NOT ${playerRef} -> what they took is
+  theirs now: that side's people, ground, gear or standing. Standing can be
+  earned against anyone.
+Apply these only where the story establishes the outcome.
+
+`;
+        const escalationBrief = `UNRESOLVED NEMESES ESCALATE, THEY DO NOT RESET
+Defeat, humiliation, injury, a failed plan or a lost resource never returns a
+Nemesis to an earlier baseline. The story may take the specific thing it took,
+and they answer that loss by adapting in a new direction. Humiliation is fuel,
+not a resolution. While they live and the matter is unresolved, never write them
+broken, resigned, or conceding that ${playerRef} has won.
+
+`;
+        const adaptationBrief = `ADAPTATION MUST RESPECT ESTABLISHED CAPABILITY
+capabilities is the whole list of what a Nemesis brings beyond ordinary ability.
+Losing teaches a lesson, and a lesson is not a new power. Adaptation never grants
+strength, speed, skill, knowledge, equipment, magic, rank or allies — the story
+must first establish them getting it. Until then they adapt with what they have:
+anticipation, ambush, position, distance, traps, numbers, changing the objective,
+or refusing that fight.
+
+`;
+        const smallestBrief = `WRITE THE SMALLEST TRUE VERSION
+When the story supports a simple version and a richer one, write the simple one.
+A field that says LESS than you could infer is correct; a field that says more
+than the story showed is a fabrication, however plausible. The commonest
+fabrications are motives nobody stated and equipment nobody showed, and "None
+established" is often the right answer.
+`;
+        const fieldBrief = `FIELD DISCIPLINE
+- physical: lasting bodily facts the scene established. ADD new detail rather
+  than dropping it. Narration that only speculates establishes nothing. Record
+  the injury at the severity shown, not the diagnosis it implies.
+- drive: the motive and what they are doing about it, as a short phrase.
+- capabilities: concrete means they can bring now and could not before — gear,
+  allies, tactics learned from losing. Not their body, not their rank, never
+  abstract competence like "learned to counter him".
+- position: their standing, the one field tracking where they RANK, so it needs
+  a starting point. Record the plain role the story gave them the first time it
+  gives it, ordinary though it is: a guard, a thief, a servant, a healer IS
+  their position. "None established" only where the story has not said. Never
+  upgrade a plain role into a rank, attach a faction never named, or record a
+  standing they are only being offered or taken toward.
+- relationships: name the relationship and what changed it, in a phrase.
+- history: CUMULATIVE, and the only field that is. Carry every major event
+  already recorded and add the new one, oldest first. NEVER replace a past event
+  with the current one. Compress old wording as the line grows; losing wording
+  is fine, losing an event is not.
+
+`;
+        // The record shape still has to be unambiguous at every size, so the
+        // brief form keeps both cases and every field name and drops only the
+        // per-field descriptions.
+        const recordShapeBrief = `NEW Nemesis — a name with no card yet. Give the full initial state:
+${START}
+mode: upsert
+name: NAME
+title: TITLE
+status: Alive | Injured | Missing | Confirmed dead
+physical: PHYSICAL
+capabilities: CAPABILITIES
+position: POSITION
+relationships: RELATIONSHIPS
+history: HISTORY
+drive: DRIVE
+return: present (in this scene, including captive or restrained) | eligible (has
+  LEFT and may return) | dormant (gone, no reason to recur) | closed (over)
+urgency: low | normal | high
+${END}
+EXISTING Nemesis — output ONLY mode, name and the fields that changed. Omitted
+fields keep their current values; never repeat unchanged fields. history is the
+exception: when you send it, send the whole rivalry.
+${START}
+mode: upsert
+name: NAME
+physical: WHAT CHANGED
+${END}
+
+`;
+        // Qualification, which decides whether a Nemesis exists at all, so it is
+        // one of the last things to give ground. The brief form keeps every
+        // qualifying route and both directions, and drops only the reassurance.
+        const significanceFull = significanceRules(playerRef);
+        const significanceBrief = `A new Nemesis requires a specific individual plus major unresolved personal
+history with ${playerRef}. That history can run in EITHER direction, and both
+directions qualify on their own.
+
+NAMING. Being unnamed is a reason to name them, not to skip them. If someone
+qualifies and the story has not named them, NAME THEM NOW, in the prose as well
+as the record — a name that never appears in the story is one nothing can
+trigger. Use what they call themselves, what others call them, or an epithet
+earned in this scene. Never rename someone already named, and never use a bare
+description like "the guard".
+
+HARMED BY ${playerRef}: severe lasting injury with survival, near or apparent
+death, permanent crippling, meaningful sparing, serious humiliation. Permanent
+crippling they survive is sufficient by itself.
+
+THEY HARMED ${playerRef}: beat them in a fight, put them down, disarmed or robbed
+them, wounded or nearly killed them, humiliated them, or walked away the clear
+winner. EQUALLY sufficient by itself — do not wait for ${playerRef} to hurt them
+back.
+
+EITHER DIRECTION: major betrayal, credible personal death threat, explicit
+revenge or obsession, repeated major confrontation, major harm to someone
+important to the other, or a major rescue or life debt.
+
+Routine hostility, a minor one-off scuffle, a shove, generic enemies and ordinary
+dislike do not qualify in either direction. Track only evolving current truth.
+Judge only events narration established before the current Do/Say attempt.`;
+        // The floor for qualification, and the same trade compact already makes
+        // one rung further down: every qualifying route survives, the two
+        // directions stop being spelled out separately.
+        const significanceMicro = `An individual qualifies for major unresolved personal history with ${playerRef},
+in EITHER direction: permanent severe injury with survival, near death, major
+defeat, betrayal, sparing or humiliation, personal revenge or a credible threat,
+repeated major conflict, or a major debt or rescue. Them beating ${playerRef} is
+as sufficient as ${playerRef} hurting them. Permanent crippling plus survival is
+sufficient alone. Routine hostility and minor scuffles are not.
+NAMING: if someone qualifies and the story has not named them, name them now, in
+the prose as well as the record. Never rename someone already named; never use a
+bare description like "the guard".
+Judge only events narration established before the current Do/Say attempt.`;
+        // The last rung above compact. Below this the six teaching blocks stop
+        // being worth their headings, so they collapse into one dense block that
+        // still states every rule they state. Authored as one piece rather than
+        // six terse ones because most of what is left at this size is heading
+        // and restatement, and merging them buys ~700 characters for free.
+        const combinedTerse = `OUTCOME DRIVERS — hurt and survived -> physical. LOST, spared or humiliated ->
+capabilities records the CONCRETE method they change to (gear they went and got,
+help they did not bring last time, ground they pick, a trap, refusing a fight
+they cannot win), never a claim to have solved it. WON against ${playerRef} ->
+history records the win plainly and what it cost him; position and title rise
+only where others treat them differently for it. Beat, broke or killed someone
+who is NOT ${playerRef} -> what they took is theirs now, and standing can be
+earned against anyone. Apply only where the story establishes the outcome.
+
+UNRESOLVED NEMESES ESCALATE, THEY DO NOT RESET — defeat, humiliation, injury or
+a lost resource never returns a Nemesis to an earlier baseline. They answer the
+specific loss by adapting in a new direction. Humiliation is fuel, not a
+resolution. While they live and the matter is unresolved, never write them
+broken, resigned, or conceding that ${playerRef} has won.
+
+ADAPTATION — losing teaches a lesson, and a lesson is not a new power. Never
+grant strength, speed, skill, knowledge, equipment, rank or allies the story has
+not established them getting. Until then they adapt with what they have:
+anticipation, ambush, position, distance, traps, numbers, or refusing that fight.
+
+FIELD DISCIPLINE — physical: lasting bodily facts the scene established, ADDED
+not replaced, at the severity shown rather than the diagnosis it implies.
+capabilities: concrete means they could not bring before; never their body, their
+rank, or abstract competence. position: their standing, so it needs a starting
+point — record the plain role the story gave them the first time it gives it, a
+guard, a thief, a servant or a healer IS their position; never upgrade it,
+attach a faction never named, or record a standing only being offered to them. drive: the motive and what they are doing about it.
+relationships: what they are to ${playerRef} and what made it so. history:
+CUMULATIVE, the only field that is — carry every major event, oldest first, and
+NEVER replace a past event with the current one; compress wording, never events.
+
+STANCE FIELDS — drive, relationships and urgency go stale as physical, position
+and history do not. Reassess all three every record, re-state one only where the
+story supports it. A reaction is not a standing motivation once they do anything
+deliberate.
+
+WRITE THE SMALLEST TRUE VERSION — a field that says more than the story showed is
+a fabrication, however plausible, and "None established" is often the right
+answer.
+
+`;
+        const recordTask = shouldRequestRecord ? `
+<SYSTEM>
+# NEMESIS SYSTEM
+## OUTPUT ORDER — REQUIRED
+1. If an earlier Inner Self SYSTEM instruction requires a parenthetical brain operation, output it first exactly as Inner Self requires, followed by one space.
+2. Then exactly one SHORT Nemesis record, beginning ${START} and ending ${END}.
+3. Immediately after ${END}, continue the story prose, which must be the majority of the response.
+4. Do not explain the record and put no other prose before it.
+
+## NEMESIS DECISION
+${significanceRules(playerRef)}
+- Use the CURRENT player Do/Say action only if the continuation you are about to write will establish that consequence as canon. Decide that outcome first; if the action fails or creates no qualifying development, do not record it. Record and continuation must never contradict each other.
+- Upserts are complete snapshots: preserve still-true facts, replace superseded ones.
+- ${existingForAnalysis}
+${maintenancePrompt}
+
+${returnSectionFull}${rivalrySection}${resolutionSection}
+## EXACT RECORD SHAPE
+${knownList}
+
+${recordShapeSection}${outcomeSection}${escalationSection}${adaptationSection}${namedPlayer ? `NAME THE PLAYER. The player character is called ${playerRef}. Write that
+name in record values — "${playerRef} is a personal enemy", not "the player is a
+personal enemy". Never write "the player" or "the protagonist" as a stand-in for
+a character who has a name.\n` : ""}
+${smallestSection}${calibrationSection}
+${fieldSection}${stanceSection}After losing a confrontation, a typical delta is capabilities alone:
+${START}
+mode: upsert
+name: <their name>
+capabilities: <what they added in response to losing>
+${END}
+
+${deltaExampleSection}For no qualifying change, output exactly:
 ${START}
 mode: none
 ${END}
@@ -10581,6 +11025,13 @@ ${END}
 The record comes first (after any required Inner Self parenthetical), then the story. Never omit ${START} or ${END}. Never replace the record with JSON, XML, commentary or prose.
 </SYSTEM>` : "";
 
+        // Compact used to be the only rung below standard and dropped FIELD
+        // DISCIPLINE entirely. It is affordable here, but only where the room
+        // exists: compact-lean below is compact without this line, so the
+        // narrow band that used to select compact never falls through to micro
+        // just because compact grew.
+        const compactFieldLine = `FIELD DISCIPLINE: physical is lasting bodily fact only, added not replaced, at the severity shown rather than the diagnosis implied. position is their standing and needs a starting point — record the plain role the story gave them the first time it gives it (a guard, a thief, a healer IS their position); never upgrade it, attach a faction never named, or record a standing they are only being offered. history is CUMULATIVE and the only field that is: carry every major event, oldest first, and NEVER replace a past event with the current one. Write the smallest true version; "None established" is often right.
+`;
         const compactRecordTask = shouldRequestRecord ? `
 <SYSTEM>
 # NEMESIS SYSTEM — STRICT OUTPUT FORMAT
@@ -10590,7 +11041,7 @@ An individual qualifies for major unresolved personal history: permanent severe 
 You MAY use the current Do/Say action only if the continuation you are about to write actually establishes that qualifying consequence. Keep record and prose consistent.
 ESCALATION: an unresolved Nemesis never resets to an earlier baseline. Losses take the specific thing the story took; humiliation is fuel, not a resolution. While they live and the matter is unresolved, never write them broken, resigned, or conceding the player has won.
 ADAPTATION: losing teaches a lesson, not a new power. capabilities lists everything a Nemesis brings beyond ordinary ability; never narrate one matching a capability the story has not shown them acquire. They adapt with what they have — anticipation, ambush, position, distance, traps, numbers — or the story establishes them getting more first. Write concrete means, not "learned to counter him".
-${returnSectionCompact}${resolutionSection}${knownList}
+${compactFieldLine}${returnSectionCompact}${rivalrySection}${resolutionSection}${knownList}
 No change exactly:
 ${START}
 mode: none
@@ -10600,15 +11051,15 @@ ${START}
 mode: upsert
 name: NAME
 title: TITLE
-status: STATUS
+status: Alive | Injured | Missing | Confirmed dead
 physical: PHYSICAL
 capabilities: CAPABILITIES
 position: POSITION
 relationships: RELATIONSHIPS
 history: HISTORY
 drive: DRIVE
-return: RETURN_STATE
-urgency: URGENCY
+return: present (in this scene, INCLUDING captive, restrained or guarded) | eligible | dormant | closed
+urgency: low | normal | high
 ${END}
 EXISTING Nemesis — ONLY the fields that changed. Omitted fields keep their current values; never repeat unchanged fields:
 ${START}
@@ -10626,7 +11077,7 @@ Start with any REQUIRED Inner Self parenthetical operation, then immediately ${S
 Current Do/Say may qualify only if the story you are about to write actually establishes it. Permanent crippling injury + survival is sufficient.
 ${returnSectionMicro}${resolutionMicro}${knownList}
 No change: ${START}\nmode: none\n${END}
-NEW: ${START}\nmode: upsert\nname: NAME\ntitle: TITLE\nstatus: STATUS\nphysical: PHYSICAL\ncapabilities: CAPABILITIES\nposition: POSITION\nrelationships: RELATIONSHIPS\nhistory: HISTORY\ndrive: DRIVE\nreturn: RETURN_STATE\nurgency: URGENCY\n${END}
+NEW: ${START}\nmode: upsert\nname: NAME\ntitle: TITLE\nstatus: Alive|Injured|Missing|Confirmed dead\nphysical: PHYSICAL\ncapabilities: CAPABILITIES\nposition: POSITION\nrelationships: RELATIONSHIPS\nhistory: HISTORY\ndrive: DRIVE\nreturn: present (in scene, incl. captive)|eligible|dormant|closed\nurgency: URGENCY\n${END}
 EXISTING: only changed fields; omitted fields keep their values. ${START}\nmode: upsert\nname: NAME\nphysical: WHAT CHANGED\n${END}
 Never omit BEGIN/END. Story prose comes only after END.
 </SYSTEM>` : "";
@@ -10654,20 +11105,56 @@ ${returnSectionCompact}</SYSTEM>` : "";
             const leanRecordTask = (returnSectionFull && recordTask)
                 ? recordTask.replace(returnSectionFull, returnSectionCompact)
                 : "";
-            // Standard: everything that decides what goes ON the card — record
-            // shape, field discipline, outcome drivers, adaptation, qualification
-            // — with the two prose sections compressed. This is the step that
-            // stops a 500-character overrun from costing every rule at once,
-            // which matters most with Inner Self sharing the same context.
-            const standardBase = leanRecordTask || recordTask;
-            const standardRecordTask = standardBase
-                ? standardBase.replace(calibrationSection, "").replace(stanceSection, stanceSectionBrief)
-                : "";
+            // GRADED DEGRADATION. Below full there used to be exactly one rung,
+            // standard (~11k), and then compact (~2.4k). Measured, that left
+            // compact serving every adventure whose room fell between 2,500 and
+            // 11,050 — an 8,550-character band in which the task ran at 2.4k and
+            // simply wasted the rest, up to 8,589 characters of room the model
+            // never got. Worse, the drop is where FIELD DISCIPLINE disappears, so
+            // the difference between the two rungs was not detail, it was rules.
+            //
+            // These are the reduction steps, ordered so the least costly runs
+            // first: worked examples go before prose, prose goes before rules,
+            // and the rules that shape the card go last. Each rung applies one
+            // more step, so the task shrinks to fit the room instead of falling
+            // off a cliff. A step whose text is not present (an optional section
+            // that never rendered) is simply skipped.
+            //
+            // The named rungs are the ones worth seeing in debug. standard is
+            // the first two steps, and is byte-identical to what it was before
+            // this ladder existed, so nothing that referenced it has moved.
+            const reductions = [
+                [calibrationSection, "", ""],
+                [stanceSection, stanceSectionBrief, "standard"],
+                [smallestSection, smallestBrief, ""],
+                [outcomeSection, outcomeBrief, "detailed"],
+                [escalationSection, escalationBrief, ""],
+                [adaptationSection, adaptationBrief, ""],
+                [deltaExampleSection, "", "core"],
+                [fieldSection, fieldBrief, "essential"],
+                [recordShapeSection, recordShapeBrief, ""],
+                [significanceFull, significanceBrief, "minimal"],
+                // Last rung above compact: the six teaching blocks merge into one.
+                [outcomeBrief, combinedTerse, ""],
+                [escalationBrief, "", ""],
+                [adaptationBrief, "", ""],
+                [smallestBrief, "", ""],
+                [stanceSectionBrief, "", ""],
+                [fieldBrief, "", "skeletal"],
+                [significanceBrief, significanceMicro, "bare"]
+            ];
+            const graded = [];
+            let reduced = leanRecordTask || recordTask;
+            for (const [from, to, name] of reductions) {
+                if (reduced && from && reduced.includes(from)) reduced = reduced.replace(from, to);
+                if (name && reduced) graded.push([reduced, name]);
+            }
             const candidates = [
                 [recordTask, "full"],
                 ...(leanRecordTask ? [[leanRecordTask, "full-lean"]] : []),
-                ...(standardRecordTask ? [[standardRecordTask, "standard"]] : []),
+                ...graded,
                 [compactRecordTask, "compact"],
+                [compactRecordTask.replace(compactFieldLine, ""), "compact-lean"],
                 [microRecordTask, "micro"]
             ];
             const maxChars = Number.isInteger(info.maxChars) ? info.maxChars : Infinity;
@@ -10720,7 +11207,12 @@ ${returnSectionCompact}</SYSTEM>` : "";
         if (addon) text = `${text.trimEnd()}\n\n${addon}\n\n`;
         NS.diagnostic.taskChars = chosenRecord.length;
         NS.diagnostic.taskPresent = !!(chosenRecord && text.includes(chosenRecord));
-        NS.diagnostic.strictSystem = !!(chosenRecord && chosenRecord.includes("<SYSTEM>") && chosenRecord.includes("# STRICT OUTPUT FORMAT"));
+        // What this actually needs to report is that the task reached the model
+        // inside a SYSTEM block. It used to also require the words "STRICT
+        // OUTPUT FORMAT", which only the compact and micro variants carry, so a
+        // perfectly healthy full task always printed NO next to the word
+        // "Strict" — a line that reads like a failure while nothing is wrong.
+        NS.diagnostic.systemWrapped = !!(chosenRecord && chosenRecord.includes("<SYSTEM>"));
         NS.diagnostic.contextAfter = text.length;
         NS.stages.analysisRequested = shouldRequestRecord;
         NS.stages.taskInserted = NS.diagnostic.taskPresent;
@@ -10820,7 +11312,7 @@ ${returnSectionCompact}</SYSTEM>` : "";
                 ...base,
                 name,
                 title: data.title || base.title,
-                status: data.status || base.status,
+                status: normalizeStatus(data.status, base.status),
                 physical: data.physical || base.physical,
                 capabilities: data.capabilities || base.capabilities,
                 position: data.position || base.position,
