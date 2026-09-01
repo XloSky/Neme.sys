@@ -8954,7 +8954,7 @@ function AutoCards(inHook, inText, inStop) {
 // Your other library scripts go here
 
 /**
- * Nemesis Engine v0.9.4-alpha
+ * Nemesis Engine v0.9.14-alpha
  * Companion module for LewdLeah's Inner Self v1.0.2 / AI Dungeon.
  *
  * DESIGN GOALS
@@ -8991,6 +8991,7 @@ function NemesisSystem(hook) {
         allowReturns: true,
         survivalGuidance: true,
         returnChance: 12,
+        rewindThoughts: true,          // undo an Inner Self thought whose generation was discarded
         allowRivalries: true,          // may two Nemeses collide with each other
         rivalryChance: 8,              // chance per eligible turn of offering one              // % per eligible context turn
         returnCooldown: 8,             // turns between global return attempts
@@ -9028,7 +9029,7 @@ function NemesisSystem(hook) {
     // is 8 turns, so this costs nothing in practice — it only rules out returns
     // that the cooldown was going to block anyway.
     const MIN_ABSENCE_TURNS = 6;
-    const VERSION = "v0.9.4-alpha";
+    const VERSION = "v0.9.15-alpha";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
@@ -9136,22 +9137,40 @@ function NemesisSystem(hook) {
         const who = escapeRegExp(cleanName(name));
         if (!who) return "";
         const src = normalize(String(source || "")).replace(/\n+/g, " ");
+        // The third pattern is flagged strict for a reason found live. The first
+        // two are ANCHORED — "named"/"called", or a comma before the role — so
+        // whatever they capture really is standing in apposition to the name.
+        // The third has no anchor at all: "the <words> <Name>" also matches an
+        // ordinary subject-verb-object sentence, and a live card came back
+        // reading "Position: Mist hits" from the line "The mist hits Power square
+        // in the face". "The crowd watches Power" and "The rain soaks Kestrel"
+        // fail the same way.
+        //
+        // What separates the two cases is length. A real appositive role reduces
+        // to a single noun once tidyRole has stripped the adjectives — "the young
+        // guard <Name>" leaves "guard" — while the false matches always leave a
+        // noun with a verb still attached. So the unanchored pattern is only
+        // allowed to yield ONE word. That gives up "the palace guard <Name>",
+        // which is a fair price: an unrecorded position is fixed by the next
+        // record, an invented one becomes continuity.
         const patterns = [
             // "a guard named <Name>" / "an outrider called <Name>"
-            new RegExp(`\\b(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s+(?:named|called)\\s+${who}\\b`, "i"),
+            [new RegExp(`\\b(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s+(?:named|called)\\s+${who}\\b`, "i"), false],
             // "<Name>, a guard," / "<Name> — the healer."
-            new RegExp(`\\b${who}\\b\\s*[,—-]\\s*(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s*(?:[,.;—]|\\band\\b|$)`, "i"),
-            // "the guard <Name>"
-            new RegExp(`\\b(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s+${who}\\b`, "i")
+            [new RegExp(`\\b${who}\\b\\s*[,—-]\\s*(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s*(?:[,.;—]|\\band\\b|$)`, "i"), false],
+            // "the guard <Name>" — unanchored, so single-word results only
+            [new RegExp(`\\b(?:a|an|the)\\s+([a-z][a-z'\\- ]{1,28}?)\\s+${who}\\b`, "i"), true]
         ];
-        for (const re of patterns) {
+        for (const [re, strict] of patterns) {
             const m = src.match(re);
             if (!m) continue;
             // A pattern that matches OWNS the verdict. "A man named <Name>" matches
             // the first pattern and yields nothing — falling through to a looser
             // pattern on the same sentence is how "man named" became "Named".
             const role = tidyRole(m[1]);
-            return (role && role.toLowerCase() !== cleanName(name).toLowerCase()) ? role : "";
+            if (!role) return "";
+            if (strict && role.includes(" ")) return "";
+            return (role.toLowerCase() !== cleanName(name).toLowerCase()) ? role : "";
         }
         return "";
     };
@@ -9260,6 +9279,24 @@ function NemesisSystem(hook) {
             historyLen: Array.isArray(history) ? history.length : null
         };
     }
+    // Persistent hook census. NS.stages is rebuilt every context hook, so it can
+    // only ever say whether context ran THIS turn — it cannot tell the difference
+    // between "the context modifier is not wired up" and "the context modifier is
+    // never going to run in this adventure".
+    //
+    // That distinction matters now. AI Dungeon's Optimized Context setting stops
+    // scripts touching context at all, which leaves the input and output hooks
+    // running normally while the context hook never fires. Everything about
+    // Neme.sys depends on the context hook, so the whole system goes quiet — and
+    // without this census the debug panel blamed the player's Modifier tabs for
+    // a setting that is working exactly as designed.
+    NS.hooksSeen = NS.hooksSeen || { input: 0, context: 0, output: 0 };
+    {
+        const seen = String(hook || "").toLowerCase();
+        const key = (seen === "context" || Number.isInteger(info.maxChars)) ? "context"
+            : (seen === "input" || seen === "output") ? seen : "";
+        if (key) NS.hooksSeen[key] = (NS.hooksSeen[key] || 0) + 1;
+    }
 
     const isConfigCard = card => {
         const t = normalize(card?.title || "").toLowerCase().replace(/\s+/g, " ");
@@ -9366,9 +9403,14 @@ function NemesisSystem(hook) {
         if (!cfg?.autoRegisterInnerSelf) return;
         NS.registered ??= {};
         const added = [];
+        // Case-insensitive, because Inner Self stores agent names in its own
+        // casing. A Nemesis card reading "Power" against a list already holding
+        // "power" looked unregistered on every single turn, so this retried for
+        // the life of the adventure and never once succeeded.
+        const owned = new Set(Object.keys(NS.registered).map(n => n.toLowerCase()));
         for (const { snap } of cards || []) {
             const name = cleanName(snap?.name || "");
-            if (!name || NS.registered[name]) continue;
+            if (!name || owned.has(name.toLowerCase())) continue;
             if (registerWithInnerSelf(name) && NS.registered[name]) added.push(name);
         }
         if (added.length) NS.stages.registered = added.join(", ");
@@ -9467,6 +9509,7 @@ function NemesisSystem(hook) {
             enabled: parseBool(read("Enable Nemesis"), DEFAULTS.enabled),
             autoDiscover: parseBool(read("Automatic discovery"), DEFAULTS.autoDiscover),
             autoRegisterInnerSelf: parseBool(read("Auto-register Nemeses with Inner Self"), DEFAULTS.autoRegisterInnerSelf),
+            rewindThoughts: parseBool(read("Rewind Inner Self thoughts on retry/erase"), DEFAULTS.rewindThoughts),
             allowReturns: parseBool(read("Allow return events"), DEFAULTS.allowReturns),
             allowRivalries: parseBool(read("Allow rivalries between Nemeses"), DEFAULTS.allowRivalries),
             rivalryChance: parseIntField(read("Rivalry event chance"), DEFAULTS.rivalryChance, 0, 100),
@@ -9492,6 +9535,7 @@ function NemesisSystem(hook) {
             `Enable Nemesis: ${cfg.enabled}`,
             `Automatic discovery: ${cfg.autoDiscover}`,
             `Auto-register Nemeses with Inner Self: ${cfg.autoRegisterInnerSelf}`,
+            `Rewind Inner Self thoughts on retry/erase: ${cfg.rewindThoughts}`,
             `Player name: "${player === "the protagonist" ? "Example" : player}"`,
             `Allow return events: ${cfg.allowReturns}`,
             `Allow rivalries between Nemeses: ${cfg.allowRivalries}`,
@@ -9851,6 +9895,123 @@ function NemesisSystem(hook) {
         return true;
     };
 
+    // ── Inner Self thought rewind ───────────────────────────────────────────
+    // Inner Self already NOTICES a retry: it hashes recent history and, on a
+    // match, returns early so the same thought is not written twice. That stops
+    // duplicates but never un-writes anything, so today a Retry leaves the brain
+    // holding a thought about the generation you threw away while the generation
+    // you KEPT gets none, and an Erase leaves its thought in the brain forever.
+    //
+    // Rewinding it needs three things, and we already have all three:
+    //   - detection, which is rollbackDiscardedWrite()'s history-length test;
+    //   - a moment to snapshot, which the hook order hands over free, because
+    //     Output runs Nemesis BEFORE Inner Self and the brain card is therefore
+    //     still pre-write when we look at it;
+    //   - somewhere to restore TO, which is card.description — Inner Self parses
+    //     a brain out of it and serialises the brain back into it, so the Notes
+    //     are the source of truth for a brain exactly as they are for a Nemesis.
+    //
+    // This is the only place Neme.sys writes to Inner Self's own data, so it is
+    // gated on the contract below rather than on a version string. A version
+    // number can stay the same while internals move; this checks the specific
+    // fields the rewind actually touches, and switches itself off if any of them
+    // is missing or the wrong shape.
+    const innerSelfContract = () => {
+        const IS = state?.InnerSelf;
+        if (!IS || typeof IS !== "object" || Array.isArray(IS)) return "no Inner Self state";
+        if (typeof IS.hash !== "string") return "InnerSelf.hash is not a string";
+        if (typeof IS.agent !== "string") return "InnerSelf.agent is not a string";
+        return "";
+    };
+
+    // The state check above is weaker than it looks: Inner Self rebuilds its own
+    // state at the top of every hook, so a missing field is usually repaired
+    // before we ever see it. The guard that actually earns its place is this
+    // one, on the card, because nothing repairs that for us. If a future Inner
+    // Self stops keeping brains in Notes with an operation log in the Entry,
+    // these stop matching and the rewind quietly stops touching anything.
+    const looksLikeBrain = card =>
+        typeof card?.description === "string"
+        && typeof card?.entry === "string"
+        && /^\/\/ initialized @|\.brain\b/m.test(String(card.entry || ""));
+
+    // A brain card is identified by agent metadata in its keys, which is how
+    // Inner Self itself finds them.
+    const findBrainCard = agentName => {
+        const wanted = cleanName(agentName).toLowerCase();
+        if (!wanted) return null;
+        for (const card of storyCards) {
+            const keys = String(card?.keys || "");
+            if (!keys.includes('"agent"')) continue;
+            try {
+                const meta = JSON.parse(keys);
+                if (cleanName(String(meta?.agent || "")).toLowerCase() === wanted) return card;
+            } catch { /* not a brain card */ }
+        }
+        return null;
+    };
+
+    // Called from the output hook BEFORE Inner Self runs, so what we capture is
+    // the brain as it stood before this generation touched it. IS.agent holds
+    // whichever agent the context hook armed; a lone space is Inner Self's
+    // "triggered nothing" sentinel, so it trims to empty and we take no snapshot.
+    const snapshotThought = cfg => {
+        if (!cfg?.rewindThoughts) return;
+        const broken = innerSelfContract();
+        if (broken) { NS.stages.rewindOff = broken; return; }
+        const agentName = String(state.InnerSelf.agent || "").trim();
+        if (!agentName) return;
+        const card = findBrainCard(agentName);
+        if (!card) return;
+        if (!looksLikeBrain(card)) { NS.stages.rewindOff = "brain card is not in the expected shape"; return; }
+        NS.brainUndo = Array.isArray(NS.brainUndo) ? NS.brainUndo : [];
+        NS.brainUndo.push({
+            agent: agentName,
+            description: String(card.description || ""),
+            entry: String(card.entry || ""),
+            len: history.length
+        });
+        // Brains are far larger than a Nemesis snapshot, so this stack is kept
+        // shorter than the card one to keep `state` small.
+        while (NS.brainUndo.length > 3) NS.brainUndo.shift();
+    };
+
+    // Called from the context hook beside rollbackDiscardedWrite, and using the
+    // identical test: a normal forward turn grows history past the length the
+    // write was made at, while Retry and Erase do not.
+    const rollbackDiscardedThought = cfg => {
+        const stack = Array.isArray(NS.brainUndo) ? NS.brainUndo : [];
+        if (!stack.length) return false;
+        if (!cfg?.rewindThoughts || innerSelfContract()) { NS.brainUndo = []; return false; }
+        const undone = [];
+        while (stack.length) {
+            const undo = stack[stack.length - 1];
+            if (!undo || typeof undo !== "object" || !undo.agent) { stack.pop(); continue; }
+            if (history.length > undo.len) break;   // this thought survived
+            stack.pop();
+            const card = findBrainCard(undo.agent);
+            if (!card) continue;
+            // Re-checked at restore time, not just at snapshot time: the shape
+            // could have changed in between, and putting a brain back into a
+            // format Inner Self no longer uses would be the one way this feature
+            // could actually destroy something.
+            if (!looksLikeBrain(card)) { NS.stages.rewindOff = "brain card is not in the expected shape"; continue; }
+            if (String(card.description || "") === undo.description) continue; // nothing was written
+            card.description = undo.description;
+            card.entry = undo.entry;
+            undone.push(undo.agent);
+        }
+        NS.brainUndo = stack;
+        if (!undone.length) return false;
+        // Inner Self skips a turn whose history hash it has already processed.
+        // Left set, that would suppress the REPLACEMENT generation's thought too,
+        // and the rewind would read as "thoughts stopped working". Clearing it
+        // lets the generation the player actually kept write its own.
+        try { state.InnerSelf.hash = ""; } catch {}
+        NS.stages.thoughtRewound = undone.join(", ");
+        return true;
+    };
+
     const nemesisCards = () => storyCards.filter(isNemesisCard).map(card => {
         syncEntryFromNotes(card);
         const snap = parseSnapshot(card);
@@ -10116,6 +10277,19 @@ function NemesisSystem(hook) {
             NS.debugRaw = "";
         }
 
+        // A generation that was ALL bookkeeping and no story. Nothing was eaten
+        // here — there was never any prose to keep — but the player still sees an
+        // empty reply and has to retry, so it must be diagnosable rather than
+        // silent. Reported live as "reply eating" when the context is full, which
+        // is exactly when the model has least room to spend on prose.
+        if (!rebuilt && records.length) {
+            try {
+                NS.stages.recordOnly = true;
+                // Tells the NEXT context hook to skip the record request, so the
+                // replacement generation can spend its whole output on the story.
+                NS.recordAteTurn = true;
+            } catch {}
+        }
         text = rebuilt;
         if (!text) text = "\u200B";
         return records;
@@ -10234,13 +10408,29 @@ function NemesisSystem(hook) {
     // off-page: if it is not narrated, it did not happen.
     // -------------------------------------------------------------------------
     const pickRivalryEvent = (cards, cfg) => {
-        if (!cfg.allowRivalries || cfg.rivalryChance <= 0) return null;
-        if ((turn() - (NS.lastRivalryAttempt ?? -999999)) < RIVALRY_COOLDOWN) return null;
+        // Every refusal says WHY. A rivalry is rare by design — 8% behind a
+        // twelve-turn cooldown — so "it did not happen" is the normal outcome
+        // and looks identical to "it is broken". Without a reason on every exit
+        // there is no way to tell a system that is working and waiting from one
+        // that never fires at all, which is exactly how the feature could ship
+        // and never be noticed either way.
+        const no = why => { NS.stages.rivalryBlocked = why; return null; };
+        if (!cfg.allowRivalries || cfg.rivalryChance <= 0) {
+            return no("turned off in Configure Nemesis");
+        }
+        const since = turn() - (NS.lastRivalryAttempt ?? -999999);
+        if (since < RIVALRY_COOLDOWN) {
+            return no(`cooldown: ${RIVALRY_COOLDOWN - since} more accepted turns`);
+        }
         const living = cards.filter(({ snap }) =>
             !CONFIRMED_DEAD.test(String(snap.status || ""))
             && String(snap.returnState).toLowerCase() !== "closed");
-        if (living.length < 2) return null;
-        if ((Math.random() * 100) >= cfg.rivalryChance) return null;
+        if (living.length < 2) {
+            return no(`needs two living Nemeses, there ${living.length === 1 ? "is 1" : `are ${living.length}`}`);
+        }
+        if ((Math.random() * 100) >= cfg.rivalryChance) {
+            return no(`chance roll missed (${cfg.rivalryChance}%)`);
+        }
 
         // The player must have a route to find out. At least one of the two has
         // to be in play, so the story has a natural vehicle — witnessed, carried
@@ -10251,11 +10441,13 @@ function NemesisSystem(hook) {
         const recent = history.slice(-5).map(a => String(a?.text ?? a?.rawText ?? "")).join("\n");
         const inPlay = living.filter(({ snap }) => nameInText(snap.name, recent)
             || (turn() - (NS.lastSeen[snap.name] ?? -999999)) <= RIVALRY_IN_PLAY);
-        if (!inPlay.length) return null;
+        if (!inPlay.length) {
+            return no("none of them are anywhere near the story, so nothing could carry the news");
+        }
 
         const near = inPlay[Math.floor(Math.random() * inPlay.length)];
         const others = living.filter(({ snap }) => snap.name !== near.snap.name);
-        if (!others.length) return null;
+        if (!others.length) return no("only one living Nemesis to pick from");
         const other = others[Math.floor(Math.random() * others.length)];
 
         // Escalating rarity. Killing removes a rivalry the player invested in, so
@@ -10303,7 +10495,7 @@ important to the other, or a major rescue or life debt.
 
 Routine hostility, a minor one-off scuffle, a shove, generic enemies,
 acquaintances, and ordinary dislike do not qualify in either direction.
-Track only evolving current truth, not baseline appearance. Current facts replace superseded facts; History retains the cause.
+Track only evolving current truth, not baseline appearance; History retains the cause.
 Judge only events already established by narration before the current unresolved Do/Say attempt.
     `.trim();
 
@@ -10362,7 +10554,22 @@ Judge only events already established by narration before the current unresolved
         const d = NS.diagnostic || {};
         const s = NS.stages || {};
         const verdict = (() => {
-            if (s.contextRan !== true) return "Context hook never ran — check the Context modifier wiring";
+            if (s.contextRan !== true) {
+                const h = NS.hooksSeen || {};
+                // Other hooks firing while context never has is the signature of
+                // Optimized Context, not of a wiring mistake. Say so, because
+                // sending someone to re-check Modifier tabs they wired correctly
+                // is worse than saying nothing.
+                if (!h.context && ((h.input || 0) + (h.output || 0)) >= 4) {
+                    return "The Context hook has NEVER run in this adventure, while Input and Output both have.\n"
+                        + "   That is what AI Dungeon's Optimized Context setting does — it stops scripts\n"
+                        + "   touching context. Neme.sys needs the context hook, so no new records can be\n"
+                        + "   requested and no card will be created or updated while it is on. Existing\n"
+                        + "   Nemesis cards still reach the story normally through their own Triggers.\n"
+                        + "   Turn Optimized Context OFF to use Neme.sys.";
+                }
+                return "Context hook never ran — check the Context modifier wiring";
+            }
             if (s.enabled === false) return "Disabled in Configure Nemesis";
             if (s.suppressed) return `Context suppressed by ${s.suppressed}`;
             if (d.needsAnalysis === false && !c.task) return "No analysis needed this turn (history unchanged)";
@@ -10416,6 +10623,17 @@ Judge only events already established by narration before the current unresolved
                 `Return prompt inserted: ${s.returnPromptInserted === true ? "YES" : s.returnPromptInserted === false ? "NO" : "—"}${s.returnCarrier ? ` (${s.returnCarrier})` : ""}`,
                 `Model reintroduced candidate: ${s.returnResult === "appeared" ? "YES" : s.returnResult === "vetoed" ? "NO (vetoed)" : "—"}`,
                 `Cooldown committed: ${s.returnCooldown || "—"}`,
+                "-- Rivalry pipeline --",
+                `Rivalry roll: ${s.rivalryOffer ? "OFFERED" : (s.rivalryBlocked ? "not offered" : "—")}`,
+                s.rivalryOffer ? `Pair and tier: ${s.rivalryOffer}` : `Why not: ${s.rivalryBlocked || "—"}`,
+                // Whether the model TOOK the offer is the part that matters, and
+                // it is knowable: a rivalry must write BOTH cards in the same
+                // generation, so one record means it was declined.
+                s.rivalryOffer
+                    ? `Model acted on it: ${s.rivalryResult === "both" ? "YES — both cards written from one generation"
+                        : s.rivalryResult === "one" ? "PARTIAL — only one card moved; the pair did not resolve"
+                        : s.rivalryResult === "none" ? "NO (vetoed as implausible, which is allowed)" : "—"}`
+                    : "",
                 s.unsupportedDetail
                     ? `\n!! Detail with no match in the story text: ${s.unsupportedDetail}\n   (may be a paraphrase — check the prose before trusting it)`
                     : "",
@@ -10434,6 +10652,18 @@ Judge only events already established by narration before the current unresolved
                     ? `>> Card deleted; also un-registered from Inner Self: ${s.unregistered}` : "",
                 s.registered
                     ? `>> Registered with Inner Self (card existed but the name was not listed): ${s.registered}` : "",
+                s.thoughtRewound
+                    ? `>> Rewound a discarded Inner Self thought: ${s.thoughtRewound}` : "",
+                s.rewindOff
+                    ? `!! Thought rewind is off — Inner Self internals did not match what it needs (${s.rewindOff}).\n   Nemesis cards are unaffected; only thought rewind is disabled.` : "",
+                NS.debugContext?.maintenanceFor
+                    ? `>> Card maintenance requested for ${NS.debugContext.maintenanceFor}${NS.debugContext.maintenanceFields ? ` (longest fields: ${NS.debugContext.maintenanceFields})` : ""}` : "",
+                (NS.debugOutput?.mode === "none" && NS.debugContext?.activeNames)
+                    ? `>> Model chose NOT to record this turn, with ${NS.debugContext.activeNames} in the scene.\n   That is the encounter rule working: an update waits until the encounter ends.\n   A NEW Nemesis is never deferred — if someone qualified and no card appeared,\n   that is a real failure, not this.` : "",
+                s.yieldedToStory
+                    ? `>> No record requested this turn: the previous generation was all bookkeeping and\n   no story. The story gets the whole output here; the same event can still be\n   recorded next turn.` : "",
+                s.recordOnly
+                    ? `!! The model wrote a record and NO story text, so this reply came out blank.\n   Retry: the card write is rolled back automatically. If it repeats, the model is\n   spending its whole output on bookkeeping — shorten Memory or raise output length.` : "",
                 s.discardedStatus
                     ? `!! Status "${s.discardedStatus}" is not one of Alive / Injured / Missing / Confirmed dead,\n   so the previous status was kept. Captivity belongs in Return: present.` : "",
                 (!s.returnCandidate && s.returnBlocked)
@@ -10471,6 +10701,7 @@ Judge only events already established by narration before the current unresolved
         const playerRef = namedPlayer ? cfg.player : "the player";
         // Retry / Erase + Continue: drop a write whose generation was discarded.
         rollbackDiscardedWrite();
+        rollbackDiscardedThought(cfg);
         NS.diagnostic = {
             ...(NS.diagnostic || {}),
             prevType: String(history[history.length - 1]?.type || "none"),
@@ -10540,9 +10771,57 @@ Named recurring opponents need not fight to the death. According to personality,
             ? Math.max(0, turn() - rcMeta.stanceTurn) : 0;
         const stanceSkipped = returnCandidate
             ? Math.max(0, (rcMeta.updates || 0) - (rcMeta.stanceUpdates || 0)) : 0;
-        const stanceNote = (returnCandidate && (stanceAge >= 5 || stanceSkipped >= 1))
-            ? `\nSTANCE AGE: drive/relationships/urgency have not changed for ${stanceAge} accepted turns${stanceSkipped ? `, across ${stanceSkipped} update(s) that changed other fields` : ""}. Check whether they still describe ${rc}.`
+        // STALE STANCE ON A NEMESIS WHO IS ACTUALLY HERE.
+        //
+        // The check above only ever looked at the return candidate, which is
+        // exactly backwards. A Nemesis the scheduler is thinking about bringing
+        // back is off-screen; a Nemesis standing in the room has their card
+        // injected into context every single turn, so a stale drive on that card
+        // steers the story continuously.
+        //
+        // Reported live: a companion who qualified during a comic argument sat at
+        // "drive: exact revenge for the insult, urgency: high" long after the
+        // story had moved on to something else entirely, because the model kept
+        // sending history-only deltas and nothing ever asked it to re-check.
+        // Nothing could: she was never a return candidate, so the one prompt that
+        // raises the question was never shown.
+        //
+        // The return candidate still wins when there is one, since that block is
+        // already about them. Otherwise the stalest Nemesis in the scene is used.
+        const stanceOf = who => {
+            const meta = NS.cards[who] || {};
+            if (!Number.isInteger(meta.stanceTurn)) return null;
+            return {
+                who,
+                age: Math.max(0, turn() - meta.stanceTurn),
+                skipped: Math.max(0, (meta.updates || 0) - (meta.stanceUpdates || 0))
+            };
+        };
+        const stanceSubject = (() => {
+            if (returnCandidate) {
+                return (stanceAge >= 5 || stanceSkipped >= 1)
+                    ? { who: rc, age: stanceAge, skipped: stanceSkipped } : null;
+            }
+            const here = cards
+                .filter(({ snap }) => snap.returnState === "present"
+                    || nameInText(snap.name, recentAcceptedText()))
+                .map(({ snap }) => stanceOf(snap.name))
+                .filter(s => s && (s.age >= 5 || s.skipped >= 2));
+            if (!here.length) return null;
+            here.sort((a, b) => (b.age - a.age) || (b.skipped - a.skipped));
+            return here[0];
+        })();
+        const stanceLine = stanceSubject
+            ? `STANCE AGE: drive/relationships/urgency have not changed for ${stanceSubject.age} accepted turns${stanceSubject.skipped ? `, across ${stanceSubject.skipped} update(s) that changed other fields` : ""}. Check whether they still describe ${stanceSubject.who}. A drive the story has moved past keeps pulling scenes back to it.`
             : "";
+        // Two slots, because the note has two homes. Inside a RETURN OPPORTUNITY
+        // it belongs to that block, which is where it has always lived. With no
+        // return candidate it had nowhere to go at all — which is precisely the
+        // case the live report was about, a Nemesis who never leaves and whose
+        // stance therefore never gets questioned. So it also gets a slot of its
+        // own in the main task, used only when no return section will carry it.
+        const stanceNote = (returnCandidate && stanceLine) ? `\n${stanceLine}` : "";
+        const stanceAlert = (!returnCandidate && stanceLine) ? `${stanceLine}\n` : "";
         const rivalrySection = rivalry ? `
 ## RIVALRY — ${rivalry.a.name} and ${rivalry.b.name}
 These two both have unfinished business with ${playerRef}, and that does not make
@@ -10611,7 +10890,27 @@ If the encounter is genuinely still undecided, continue it normally.
             ? `\nRESOLUTION: if the fight with ${activeNames[0]} is already decided (someone down, disarmed, fled or not resisting), end the scene — leave, take something, call people off, or walk. Do not keep it going for a reaction.\n`
             : "";
 
-        const shouldRequestRecord = needsAnalysis || !!maintenance;
+        // YIELD THE TURN AFTER BOOKKEEPING ATE ONE.
+        //
+        // A generation that is all record and no prose leaves the player with a
+        // blank reply. Retrying does not help by itself: the retry gets the same
+        // task in the same situation and the model does the same thing, so it
+        // comes back blank again. Reported live as several eaten replies in a
+        // row, at the exact moment a new Nemesis was being created — which is
+        // when the record is longest, because a creation carries all twelve
+        // fields while a delta carries two or three.
+        //
+        // So the turn after that happens, we simply do not ask. The story gets
+        // the whole output, the player gets their scene, and nothing is lost:
+        // the analysis hash was never committed, so the same qualifying event is
+        // still there to be recorded on the following turn. Bookkeeping can wait
+        // a turn. A story the player cannot read cannot.
+        const yieldingToStory = NS.recordAteTurn === true;
+        if (yieldingToStory) {
+            NS.recordAteTurn = false;
+            NS.stages.yieldedToStory = true;
+        }
+        const shouldRequestRecord = !yieldingToStory && (needsAnalysis || !!maintenance);
         const existingForAnalysis = activeContext
             ? `Existing active Nemesis names: ${activeContext}. Their Nemesis card entries are authoritative.`
             : "No existing Nemesis is currently active.";
@@ -10622,8 +10921,25 @@ If the encounter is genuinely still undecided, continue it normally.
         const knownList = knownNames.length
             ? `Nemeses that ALREADY have a card (send deltas for these): ${knownNames.join(", ")}.`
             : "No Nemesis cards exist yet; any qualifying record is a creation.";
+        // Maintenance used to name only History, because History is the field
+        // DESIGNED to grow. Observed live, that was the wrong target: over a long
+        // fight it was capabilities that swelled into a paragraph, and the model
+        // re-sent the whole paragraph every turn. Records reached 600-900
+        // characters against a 250-token reply, so the story got whatever was
+        // left — sometimes nothing.
+        //
+        // So the prompt now names whichever fields are ACTUALLY long on this card
+        // and says why it matters. This text only renders when maintenance is
+        // due, so naming the cost here is free on an ordinary turn.
+        const LONG_FIELD = 180;
+        const bloated = maintenance
+            ? ["capabilities", "history", "relationships", "physical", "position", "drive"]
+                .filter(f => String(maintenance.snap[f] || "").length > LONG_FIELD)
+                .sort((a, b) => String(maintenance.snap[b] || "").length
+                               - String(maintenance.snap[a] || "").length)
+            : [];
         const maintenancePrompt = maintenance
-            ? `Maintenance target: ${maintenance.snap.name}. This card is near its display limit. Rewrite History shorter WITHOUT losing an event: keep how the rivalry started, every outcome that changed them, and where it stands now; collapse repeated confrontations of the same kind into one clause that says how many and what came of them. Losing wording is fine, losing an event is not. Compress Relationships too if it repeats History.\n${snapshotForPrompt(maintenance.snap)}`
+            ? `Maintenance target: ${maintenance.snap.name}. This card is near its display limit${bloated.length ? `, and these fields have grown longest: ${bloated.join(", ")}` : ""}. Rewrite them SHORTER by replacing each with a tighter version — never by adding another clause to what is already there. History must lose no event: keep how the rivalry started, every outcome that changed them, and where it stands now; collapse repeated confrontations of the same kind into one clause saying how many and what came of them. For every other field, keep only what is still true and still useful, in as few words as it takes. Losing wording is fine, losing an event is not. Keep this whole record short: every character it spends is a character of story the player does not get.\n${snapshotForPrompt(maintenance.snap)}`
             : "";
 
         // The full task sits close to the context ceiling once Inner Self's own
@@ -10753,28 +11069,29 @@ written out because a written-out record gets reused as continuity:
   victory, betrayal, maiming or sparing is permanent and stays even after it is
   avenged. Compress old entries as the line grows; losing wording is fine,
   losing an event is not.
+  One encounter is ONE event — never an entry per blow. See the decision rules.
 
 `;
         const recordShapeSection = `Angle brackets below describe what belongs on the line. They are instructions,
 never values. Never write a bracket into a record.
 
-A) NEW Nemesis — a name with no card yet. Give the full initial state:
+A) NEW Nemesis — a name with no card yet. Write ONLY these six lines, plus any
+other field this scene genuinely established. An omitted field takes its own
+default, so writing "None established" by hand buys nothing and costs the reply
+the same as a real value — and inventing something to fill the line is worse
+than leaving it out.
 ${START}
 mode: upsert
 name: <name, as this story writes it>
-title: <epithet this story used, else None established>
 status: <Alive | Injured | Missing | Confirmed dead>
-physical: <lasting bodily change shown here, else None established>
-capabilities: <gear, allies or tactics shown here, else None established>
-position: <role or standing this story gave them, else None established>
 relationships: <what they are to ${playerRef}, and what made it so>
 history: <the whole rivalry so far, compact — every major event, oldest first>
-drive: <what they pursue now, short phrase>
 return: <where they are RIGHT NOW — present = in this scene, including captive,
   restrained, guarded or unconscious; eligible = they have actually LEFT and may
   return later; dormant = gone with no reason to recur; closed = permanently over>
-urgency: <low | normal | high>
 ${END}
+Add title, physical, capabilities, position, drive or urgency ONLY where this
+scene actually showed them.
 
 B) EXISTING Nemesis — output ONLY mode, name, and the fields that actually
 changed this turn. Every field you omit keeps its current value automatically.
@@ -10863,26 +11180,21 @@ established" is often the right answer.
   already recorded and add the new one, oldest first. NEVER replace a past event
   with the current one. Compress old wording as the line grows; losing wording
   is fine, losing an event is not.
+  One encounter is ONE event — never an entry per blow.
 
 `;
         // The record shape still has to be unambiguous at every size, so the
         // brief form keeps both cases and every field name and drops only the
         // per-field descriptions.
-        const recordShapeBrief = `NEW Nemesis — a name with no card yet. Give the full initial state:
+        const recordShapeBrief = `NEW Nemesis — write ONLY these lines, plus any field this scene actually showed.
+Omitted fields take their defaults; "None established" by hand buys nothing.
 ${START}
 mode: upsert
 name: NAME
-title: TITLE
 status: Alive | Injured | Missing | Confirmed dead
-physical: PHYSICAL
-capabilities: CAPABILITIES
-position: POSITION
-relationships: RELATIONSHIPS
-history: HISTORY
-drive: DRIVE
-return: present (in this scene, including captive or restrained) | eligible (has
-  LEFT and may return) | dormant (gone, no reason to recur) | closed (over)
-urgency: low | normal | high
+relationships: WHAT THEY ARE TO THEM AND WHY
+history: THE WHOLE RIVALRY SO FAR, COMPACT
+return: present (in this scene, incl. captive) | eligible | dormant | closed
 ${END}
 EXISTING Nemesis — output ONLY mode, name and the fields that changed. Omitted
 fields keep their current values; never repeat unchanged fields. history is the
@@ -10972,7 +11284,9 @@ guard, a thief, a servant or a healer IS their position; never upgrade it,
 attach a faction never named, or record a standing only being offered to them. drive: the motive and what they are doing about it.
 relationships: what they are to ${playerRef} and what made it so. history:
 CUMULATIVE, the only field that is — carry every major event, oldest first, and
-NEVER replace a past event with the current one; compress wording, never events.
+NEVER replace a past event with the current one; compress wording, never events. Record a NEW Nemesis the turn they qualify, never later. For one that already
+has a card, send mode: none while an encounter unfolds unless something permanent
+changed — a lasting injury, a death, a capture, one side leaving.
 
 STANCE FIELDS — drive, relationships and urgency go stale as physical, position
 and history do not. Reassess all three every record, re-state one only where the
@@ -10996,9 +11310,10 @@ answer.
 ## NEMESIS DECISION
 ${significanceRules(playerRef)}
 - Use the CURRENT player Do/Say action only if the continuation you are about to write will establish that consequence as canon. Decide that outcome first; if the action fails or creates no qualifying development, do not record it. Record and continuation must never contradict each other.
+- RECORD A NEW NEMESIS THE TURN THEY QUALIFY — never wait for the encounter to end. For one that ALREADY has a card, the encounter is ONE event: while it is unfolding send mode: none unless something PERMANENT changed — a lasting injury, a death, a capture, or one side leaving — and send ONE record for the rest when it ends.
 - Upserts are complete snapshots: preserve still-true facts, replace superseded ones.
 - ${existingForAnalysis}
-${maintenancePrompt}
+${stanceAlert}${maintenancePrompt}
 
 ${returnSectionFull}${rivalrySection}${resolutionSection}
 ## EXACT RECORD SHAPE
@@ -11030,7 +11345,7 @@ The record comes first (after any required Inner Self parenthetical), then the s
         // exists: compact-lean below is compact without this line, so the
         // narrow band that used to select compact never falls through to micro
         // just because compact grew.
-        const compactFieldLine = `FIELD DISCIPLINE: physical is lasting bodily fact only, added not replaced, at the severity shown rather than the diagnosis implied. position is their standing and needs a starting point — record the plain role the story gave them the first time it gives it (a guard, a thief, a healer IS their position); never upgrade it, attach a faction never named, or record a standing they are only being offered. history is CUMULATIVE and the only field that is: carry every major event, oldest first, and NEVER replace a past event with the current one. Write the smallest true version; "None established" is often right.
+        const compactFieldLine = `FIELD DISCIPLINE: physical is lasting bodily fact only, added not replaced, at the severity shown rather than the diagnosis implied. position is their standing and needs a starting point — record the plain role the story gave them the first time it gives it (a guard, a thief, a healer IS their position); never upgrade it, attach a faction never named, or record a standing they are only being offered. history is CUMULATIVE and the only field that is: carry every major event, oldest first, and NEVER replace a past event with the current one. Record a NEW Nemesis the turn they qualify, never later. For one that already has a card, send mode: none while an encounter unfolds unless something permanent changed (lasting injury, death, capture, one side leaving). Write the smallest true version; "None established" is often right.
 `;
         const compactRecordTask = shouldRequestRecord ? `
 <SYSTEM>
@@ -11041,25 +11356,19 @@ An individual qualifies for major unresolved personal history: permanent severe 
 You MAY use the current Do/Say action only if the continuation you are about to write actually establishes that qualifying consequence. Keep record and prose consistent.
 ESCALATION: an unresolved Nemesis never resets to an earlier baseline. Losses take the specific thing the story took; humiliation is fuel, not a resolution. While they live and the matter is unresolved, never write them broken, resigned, or conceding the player has won.
 ADAPTATION: losing teaches a lesson, not a new power. capabilities lists everything a Nemesis brings beyond ordinary ability; never narrate one matching a capability the story has not shown them acquire. They adapt with what they have — anticipation, ambush, position, distance, traps, numbers — or the story establishes them getting more first. Write concrete means, not "learned to counter him".
-${compactFieldLine}${returnSectionCompact}${rivalrySection}${resolutionSection}${knownList}
+${compactFieldLine}${stanceAlert}${returnSectionCompact}${rivalrySection}${resolutionSection}${knownList}
 No change exactly:
 ${START}
 mode: none
 ${END}
-NEW Nemesis — full initial state:
+NEW Nemesis — ONLY these lines, plus any field this scene actually showed. Omitted fields take their defaults; do not write "None established" by hand.
 ${START}
 mode: upsert
 name: NAME
-title: TITLE
 status: Alive | Injured | Missing | Confirmed dead
-physical: PHYSICAL
-capabilities: CAPABILITIES
-position: POSITION
-relationships: RELATIONSHIPS
-history: HISTORY
-drive: DRIVE
+relationships: WHAT THEY ARE TO THEM AND WHY
+history: THE WHOLE RIVALRY SO FAR, COMPACT
 return: present (in this scene, INCLUDING captive, restrained or guarded) | eligible | dormant | closed
-urgency: low | normal | high
 ${END}
 EXISTING Nemesis — ONLY the fields that changed. Omitted fields keep their current values; never repeat unchanged fields:
 ${START}
@@ -11073,11 +11382,11 @@ FIRST non-whitespace text must be the required Inner Self parenthetical or ${STA
         const microRecordTask = shouldRequestRecord ? `
 <SYSTEM>
 # STRICT OUTPUT FORMAT
-Start with any REQUIRED Inner Self parenthetical operation, then immediately ${START}. Otherwise start directly with ${START}. Emit one record, then ${END}, then normal story.
+Start with any REQUIRED Inner Self parenthetical operation, then immediately ${START}. Otherwise start directly with ${START}. Emit one record, then ${END}, then normal story. The story must be MOST of the output; a record with no story after it loses the player's turn.
 Current Do/Say may qualify only if the story you are about to write actually establishes it. Permanent crippling injury + survival is sufficient.
 ${returnSectionMicro}${resolutionMicro}${knownList}
 No change: ${START}\nmode: none\n${END}
-NEW: ${START}\nmode: upsert\nname: NAME\ntitle: TITLE\nstatus: Alive|Injured|Missing|Confirmed dead\nphysical: PHYSICAL\ncapabilities: CAPABILITIES\nposition: POSITION\nrelationships: RELATIONSHIPS\nhistory: HISTORY\ndrive: DRIVE\nreturn: present (in scene, incl. captive)|eligible|dormant|closed\nurgency: URGENCY\n${END}
+NEW (only these lines, plus any field the scene actually showed; omitted fields take defaults): ${START}\nmode: upsert\nname: NAME\nstatus: Alive|Injured|Missing|Confirmed dead\nrelationships: WHAT THEY ARE AND WHY\nhistory: THE RIVALRY SO FAR\nreturn: present (in scene, incl. captive)|eligible|dormant|closed\n${END}
 EXISTING: only changed fields; omitted fields keep their values. ${START}\nmode: upsert\nname: NAME\nphysical: WHAT CHANGED\n${END}
 Never omit BEGIN/END. Story prose comes only after END.
 </SYSTEM>` : "";
@@ -11235,7 +11544,10 @@ ${returnSectionCompact}</SYSTEM>` : "";
             task: taskKind,
             roomBefore: budget.before,
             roomAfter: budget.after || Math.max(0, maxChars - text.length - 32),
-            trimmed: budget.trimmed || 0
+            trimmed: budget.trimmed || 0,
+            maintenanceFor: maintenance ? maintenance.snap.name : "",
+            maintenanceFields: bloated.join(", "),
+            activeNames: activeNames.join(", ")
         };
         emitDebug(cfg);
         return;
@@ -11272,6 +11584,11 @@ ${returnSectionCompact}</SYSTEM>` : "";
             return;
         }
 
+        // Before Inner Self runs. Unconditional on whether a Nemesis record was
+        // found, because Inner Self writes thoughts on its own schedule and a
+        // discarded generation has to be undoable either way.
+        snapshotThought(cfg);
+
         if (!NS.expectRecord || !records.length) {
             // Bookkeeping was absent or malformed. It was stripped when recognizable,
             // but the analysis hash remains uncommitted so a later turn may retry.
@@ -11283,6 +11600,18 @@ ${returnSectionCompact}</SYSTEM>` : "";
             return;
         }
 
+        // A rivalry is the one case where the COUNT of records is the answer:
+        // both cards must be written from the same generation or the pair has
+        // not actually resolved.
+        if (NS.stages.rivalryOffer) {
+            // A single `mode: none` is the model VETOING the offer, which the
+            // design explicitly allows — not a half-written pair. Only a lone
+            // upsert means one card moved while the other did not, and that is
+            // the case worth flagging.
+            const upserts = records.filter(r =>
+                normalize(r?.data?.mode || "").toLowerCase() === "upsert").length;
+            NS.stages.rivalryResult = upserts >= 2 ? "both" : upserts === 1 ? "one" : "none";
+        }
         let validBookkeepingSeen = false;
         for (const { raw, data, loose } of records.slice(0, 3)) {
             const mode = normalize(data.mode || "").toLowerCase();
