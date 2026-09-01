@@ -8954,7 +8954,7 @@ function AutoCards(inHook, inText, inStop) {
 // Your other library scripts go here
 
 /**
- * Nemesis Engine v0.9.14-alpha
+ * Nemesis Engine v0.9.15-beta
  * Companion module for LewdLeah's Inner Self v1.0.2 / AI Dungeon.
  *
  * DESIGN GOALS
@@ -9029,7 +9029,7 @@ function NemesisSystem(hook) {
     // is 8 turns, so this costs nothing in practice — it only rules out returns
     // that the cooldown was going to block anyway.
     const MIN_ABSENCE_TURNS = 6;
-    const VERSION = "v0.9.15-alpha";
+    const VERSION = "v0.9.15-beta";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
