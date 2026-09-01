@@ -8954,7 +8954,7 @@ function AutoCards(inHook, inText, inStop) {
 // Your other library scripts go here
 
 /**
- * Nemesis Engine v0.9.15-beta
+ * Nemesis Engine v0.9.18-beta
  * Companion module for LewdLeah's Inner Self v1.0.2 / AI Dungeon.
  *
  * DESIGN GOALS
@@ -9029,7 +9029,7 @@ function NemesisSystem(hook) {
     // is 8 turns, so this costs nothing in practice — it only rules out returns
     // that the cooldown was going to block anyway.
     const MIN_ABSENCE_TURNS = 6;
-    const VERSION = "v0.9.15-beta";
+    const VERSION = "v0.9.18-beta";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
@@ -9077,10 +9077,24 @@ function NemesisSystem(hook) {
     const turn = () => Number.isInteger(info.actionCount) ? info.actionCount : history.length;
     const cleanName = (name = "") => String(name)
         .replace(/[\u200B-\u200D]/g, "")
+        // A leading list marker is the model formatting an answer, not part of
+        // anyone's name: "1) Rook", "- Rook", "3. Rook".
+        .replace(/^\s*(?:\d{1,2}[.)]|[-*•])\s+/, "")
         .replace(/^[\s"'`´‘’“”]+|[\s"'`´‘’“”]+$/g, "")
+        // A trailing ")" with no "(" to match is punctuation that drifted in
+        // from a list or an emoticon. Never part of a name.
+        .replace(/\)+$/, m => (String(name).includes("(") ? m : ""))
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 80);
+    // The task states plainly that angle brackets are instructions and never
+    // values, but stating a rule is not enforcing it. A model that leaks
+    // "<name>" or "<Alive | Injured>" into the name field was producing a real
+    // card with that as its title, and since no such string ever appears in the
+    // prose, the card could never trigger: permanent litter the player has to
+    // find and delete by hand. Fuzzing found this. Nothing else could have,
+    // because every other test writes the record itself and so never leaks.
+    const isTemplateLeak = raw => /[<>|]/.test(String(raw || ""));
     const normalize = (s = "") => String(s)
         .replace(/[\u200B-\u200D]/g, "")
         .replace(/\r/g, "")
@@ -9530,26 +9544,69 @@ function NemesisSystem(hook) {
             player,
         };
 
+        // The card is grouped rather than listed, and every switch sits directly
+        // above the rate it governs, because the two-settings-per-feature shape
+        // is only confusing when they are apart. Labels are kept BYTE-IDENTICAL
+        // to older versions: the parser finds each setting by matching its
+        // label, so rewording one silently reverts that player's choice to the
+        // default with nothing anywhere saying so. Layout is free to change;
+        // labels are not. test_config.js holds that line.
+        //
+        // Length costs nothing here. This card's trigger is a profile URL that
+        // never appears in prose, so its entry is essentially never injected
+        // into context — it is read by people, not by the model.
         card.entry = [
-            `Nemesis Engine ${VERSION} automatically turns significant recurring NPC relationships into persistent, editable continuity.`,
-            `Enable Nemesis: ${cfg.enabled}`,
-            `Automatic discovery: ${cfg.autoDiscover}`,
-            `Auto-register Nemeses with Inner Self: ${cfg.autoRegisterInnerSelf}`,
-            `Rewind Inner Self thoughts on retry/erase: ${cfg.rewindThoughts}`,
+            `Neme.sys ${VERSION} — NPCs you clash with remember it, and come back changed.`,
+            "",
+            "---- START HERE ----------------------------------------",
             `Player name: "${player === "the protagonist" ? "Example" : player}"`,
+            "   Your character. Left as Example, the AI just says \"the player\".",
+            `Show hidden Nemesis records: ${cfg.debug}`,
+            "   Turn on when something looks wrong. Explains what the script did",
+            "   and why, and is the single most useful thing to screenshot.",
+            "",
+            "---- COMEBACKS -----------------------------------------",
             `Allow return events: ${cfg.allowReturns}`,
+            `Return opportunity chance: ${cfg.returnChance}%`,
+            "   Chance per turn that a Nemesis who left gets an opening to come",
+            "   back. The AI can still refuse one that makes no sense.",
+            "",
+            "---- NEMESIS AGAINST NEMESIS ---------------------------",
             `Allow rivalries between Nemeses: ${cfg.allowRivalries}`,
             `Rivalry event chance: ${cfg.rivalryChance}%`,
-            `Allow survival and retreat guidance: ${cfg.survivalGuidance}`,
-            `Return opportunity chance: ${cfg.returnChance}%`,
-            `Turns between return attempts: ${cfg.returnCooldown}`,
-            `Turns before same Nemesis can retry: ${cfg.sameNemesisCooldown}`,
-            `Turns before an unseen Nemesis can return: ${cfg.stalePresentTurns}`,
-            `Nemesis card maintenance limit: ${cfg.historySoftLimit}`,
-            `Nemesis snapshots echoed into model task: ${cfg.maxActiveContextCards}`,
-            `Show hidden Nemesis records: ${cfg.debug}`,
+            "   Chance per turn that two of them cross paths. Needs two alive,",
+            "   with at least one near the story.",
             "",
-            "Nemesis cards are created automatically. Edit their Notes/Description to correct continuity; keep the field labels intact."
+            "---- WHAT GETS RECORDED --------------------------------",
+            `Enable Nemesis: ${cfg.enabled}`,
+            `Automatic discovery: ${cfg.autoDiscover}`,
+            "   Off means no NEW Nemeses are created. Existing cards still work.",
+            `Allow survival and retreat guidance: ${cfg.survivalGuidance}`,
+            "   Lets a losing Nemesis flee, yield or be spared rather than dying",
+            "   every time a fight goes against them.",
+            "",
+            "---- INNER SELF ----------------------------------------",
+            `Auto-register Nemeses with Inner Self: ${cfg.autoRegisterInnerSelf}`,
+            "   Gives each Nemesis inner thoughts, if Inner Self is installed.",
+            `Rewind Inner Self thoughts on retry/erase: ${cfg.rewindThoughts}`,
+            "   Undoes a thought belonging to a turn you threw away.",
+            "",
+            "---- PACING, COUNTED IN TURNS --------------------------",
+            `Turns between return attempts: ${cfg.returnCooldown}`,
+            "   Global wait after any return is offered.",
+            `Turns before same Nemesis can retry: ${cfg.sameNemesisCooldown}`,
+            "   Per-character wait, so one of them cannot monopolise comebacks.",
+            `Turns before an unseen Nemesis can return: ${cfg.stalePresentTurns}`,
+            "   How long someone must be off-screen before they count as gone.",
+            "",
+            "---- ADVANCED, safe to ignore --------------------------",
+            `Nemesis card maintenance limit: ${cfg.historySoftLimit}`,
+            "   Card size in characters before the AI is asked to condense it.",
+            `Nemesis snapshots echoed into model task: ${cfg.maxActiveContextCards}`,
+            "   How many Nemesis cards are described to the AI at once.",
+            "",
+            "Nemesis cards are created automatically. To fix continuity, edit a",
+            "card's Notes section - the Entry regenerates from it."
         ].map(line => (line === "") ? "" : `> ${line}`).join("\n");
         card.description = [
             "No NPC list is required.",
@@ -9630,8 +9687,34 @@ function NemesisSystem(hook) {
         return snap;
     };
 
-    const renderSnapshot = rawSnap => {
+    // forEntry omits the two BOOKKEEPING fields.
+    //
+    // Reported live, from an X-Men scenario: a bully qualified as a Nemesis and
+    // then "appeared in every scene". This is why. Return is scene state the
+    // SCRIPT uses to schedule comebacks, but the Entry is a story card, and a
+    // story card is injected whenever its trigger word appears — including when
+    // the character is only mentioned, or remembered, or named in passing. So
+    // "Return: present" was being read by the model as "this person is in the
+    // room RIGHT NOW", on every turn their name occurred anywhere, forever:
+    // nothing ever rewrites it, because nothing writes a card for someone who is
+    // off-screen. Model writes them in -> name appears -> card fires -> card
+    // says present -> model writes them in. A self-feeding loop with no exit.
+    //
+    // Notes keeps both fields; the ledger is unchanged and the scheduler still
+    // reads it. The Entry stops asserting where anybody is standing, which is
+    // not a fact a reference card can ever keep true.
+    const renderSnapshot = (rawSnap, forEntry = false) => {
         const snap = normalizeSnapshot(rawSnap);
+        if (forEntry) return [
+        `> Title: ${safeLine(snap.title || "None established")}`,
+        `> Status: ${safeLine(snap.status || "Unknown")}`,
+        `> Physical: ${safeLine(snap.physical || "None established")}`,
+        `> Capabilities: ${safeLine(snap.capabilities || "None established")}`,
+        `> Position: ${safeLine(snap.position || "None established")}`,
+        `> Relationships: ${safeLine(snap.relationships || "None established")}`,
+        `> History: ${safeLine(snap.history || "None established", 1500)}`,
+        `> Drive: ${safeLine(snap.drive || "Unclear")}`,
+        ].join("\n");
         return [
         `> Title: ${safeLine(snap.title || "None established")}`,
         `> Status: ${safeLine(snap.status || "Unknown")}`,
@@ -9668,13 +9751,13 @@ function NemesisSystem(hook) {
         return `${first}; …; ${tail.join("; ")}`;
     };
     const renderEntryBody = snap => {
-        const full = renderSnapshot(snap);
+        const full = renderSnapshot(snap, true);
         if (ENTRY_HEADER.length + full.length <= ENTRY_BUDGET) return full;
         // History is the field that grows without bound; spend the overrun there
         // before touching anything describing their current state.
         const skeleton = renderSnapshot({ ...snap, history: "" }).length;
         const allowance = ENTRY_BUDGET - ENTRY_HEADER.length - skeleton;
-        let body = renderSnapshot({ ...snap, history: condenseHistory(snap.history, Math.max(48, allowance)) });
+        let body = renderSnapshot({ ...snap, history: condenseHistory(snap.history, Math.max(48, allowance)) }, true);
         if (ENTRY_HEADER.length + body.length <= ENTRY_BUDGET) return body;
         // Still over: the current-state fields are themselves oversized. Trim the
         // descriptive ones, newest-information-last, before any hard truncation.
@@ -9686,7 +9769,7 @@ function NemesisSystem(hook) {
                 capabilities: safeLine(snap.capabilities, cap),
                 physical: safeLine(snap.physical, cap),
                 drive: safeLine(snap.drive, cap),
-            });
+            }, true);
             if (ENTRY_HEADER.length + body.length <= ENTRY_BUDGET) return body;
         }
         return body.slice(0, Math.max(0, ENTRY_BUDGET - ENTRY_HEADER.length));
@@ -9733,6 +9816,13 @@ function NemesisSystem(hook) {
     const isDescriptorName = raw => {
         const n = cleanName(raw);
         if (!n) return true;
+        // Template scaffolding that survived into the value. Refused outright:
+        // it is not a description of a person, it is our own instruction text
+        // coming back at us, and it can never match anything in the prose.
+        if (isTemplateLeak(n)) {
+            try { NS.stages.rejectedName = n; } catch {}
+            return true;
+        }
         const article = n.match(/^(?:the|a|an)\s+(.+)$/i);
         const core = article ? article[1] : n;
         // A proper name keeps a capital somewhere, with or without an article.
@@ -10912,8 +11002,8 @@ If the encounter is genuinely still undecided, continue it normally.
         }
         const shouldRequestRecord = !yieldingToStory && (needsAnalysis || !!maintenance);
         const existingForAnalysis = activeContext
-            ? `Existing active Nemesis names: ${activeContext}. Their Nemesis card entries are authoritative.`
-            : "No existing Nemesis is currently active.";
+            ? `Nemesis cards that may be relevant this turn: ${activeContext}. Where a card and the story disagree about them, the card is authoritative. This is a bookkeeping list, NOT a cast list: it does not mean they are in this scene, and it is never a reason to bring them into one.`
+            : "No existing Nemesis is relevant this turn.";
         // Names of every Nemesis that already has a card. The model needs this to
         // decide between a full creation record and a compact delta update.
         // Names only — a few tokens, and it is what makes delta records possible.
