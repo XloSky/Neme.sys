@@ -8954,7 +8954,7 @@ function AutoCards(inHook, inText, inStop) {
 // Your other library scripts go here
 
 /**
- * Nemesis Engine v0.9.18-beta
+ * Nemesis Engine v0.9.19-beta
  * Companion module for LewdLeah's Inner Self v1.0.2 / AI Dungeon.
  *
  * DESIGN GOALS
@@ -9029,7 +9029,7 @@ function NemesisSystem(hook) {
     // is 8 turns, so this costs nothing in practice — it only rules out returns
     // that the cooldown was going to block anyway.
     const MIN_ABSENCE_TURNS = 6;
-    const VERSION = "v0.9.18-beta";
+    const VERSION = "v0.9.19-beta";
     const CONFIG_TITLE = "Configure \nNemesis";
     const CARD_PREFIX = "⚔ Nemesis — ";
     const CARD_TYPE = "nemesis";
@@ -9505,10 +9505,16 @@ function NemesisSystem(hook) {
         card.keys = "play.aidungeon.com/profile/a_yapper";
 
         const current = String(card.entry || "");
-        const read = label => {
-            const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            const m = current.match(new RegExp(`${escaped}\\s*:\\s*([^\\n]+)`, "i"));
-            return m ? m[1].trim() : "";
+        // Extra arguments are OLD labels for the same setting. A label is the
+        // only handle the parser has, so renaming one without a fallback
+        // silently resets that player's choice to the default and says nothing.
+        const read = (...labels) => {
+            for (const label of labels) {
+                const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const m = current.match(new RegExp(`${escaped}\\s*:\\s*([^\\n]+)`, "i"));
+                if (m) return m[1].trim();
+            }
+            return "";
         };
 
         // cleanName strips the surrounding quotes the card writes, so the
@@ -9539,81 +9545,79 @@ function NemesisSystem(hook) {
                     || read("Turns before an unseen present Nemesis can return"),
                 DEFAULTS.stalePresentTurns, 1, 999),
             historySoftLimit: parseIntField(read("Nemesis card maintenance limit"), DEFAULTS.historySoftLimit, 700, 9900),
-            maxActiveContextCards: parseIntField(read("Nemesis snapshots echoed into model task"), DEFAULTS.maxActiveContextCards, 0, 5),
+            maxActiveContextCards: parseIntField(read("Nemesis names shown to the AI each turn", "Nemesis snapshots echoed into model task"), DEFAULTS.maxActiveContextCards, 0, 5),
             debug: parseBool(read("Show hidden Nemesis records"), DEFAULTS.debug),
             player,
         };
 
-        // The card is grouped rather than listed, and every switch sits directly
-        // above the rate it governs, because the two-settings-per-feature shape
-        // is only confusing when they are apart. Labels are kept BYTE-IDENTICAL
-        // to older versions: the parser finds each setting by matching its
-        // label, so rewording one silently reverts that player's choice to the
-        // default with nothing anywhere saying so. Layout is free to change;
-        // labels are not. test_config.js holds that line.
+        // Grouped rather than listed, with every switch directly above the rate
+        // it governs. Two hard constraints shape this:
         //
-        // Length costs nothing here. This card's trigger is a profile URL that
-        // never appears in prose, so its entry is essentially never injected
-        // into context — it is read by people, not by the model.
+        // 1. AI Dungeon stops letting a player EDIT a story card entry past
+        //    about 2000 characters. Shipped at 2279 once and made the card
+        //    read-only, which is worse than any amount of clutter — the whole
+        //    point of the card is that it can be edited. The entry now carries
+        //    settings only, and test_config.js fails if it grows near the cap.
+        // 2. Labels are kept BYTE-IDENTICAL to older versions. The parser finds
+        //    each setting by matching its label, so rewording one silently
+        //    reverts that player's choice to the default with nothing saying so.
+        //
+        // Explanations live in Notes, directly below in the same editor, where
+        // there is room for them and where read() never looks.
         card.entry = [
             `Neme.sys ${VERSION} — NPCs you clash with remember it, and come back changed.`,
+            "Every setting is explained in the Notes section below.",
             "",
-            "---- START HERE ----------------------------------------",
+            "-- START HERE --",
             `Player name: "${player === "the protagonist" ? "Example" : player}"`,
-            "   Your character. Left as Example, the AI just says \"the player\".",
             `Show hidden Nemesis records: ${cfg.debug}`,
-            "   Turn on when something looks wrong. Explains what the script did",
-            "   and why, and is the single most useful thing to screenshot.",
             "",
-            "---- COMEBACKS -----------------------------------------",
+            "-- COMEBACKS --",
             `Allow return events: ${cfg.allowReturns}`,
             `Return opportunity chance: ${cfg.returnChance}%`,
-            "   Chance per turn that a Nemesis who left gets an opening to come",
-            "   back. The AI can still refuse one that makes no sense.",
             "",
-            "---- NEMESIS AGAINST NEMESIS ---------------------------",
+            "-- NEMESIS AGAINST NEMESIS --",
             `Allow rivalries between Nemeses: ${cfg.allowRivalries}`,
             `Rivalry event chance: ${cfg.rivalryChance}%`,
-            "   Chance per turn that two of them cross paths. Needs two alive,",
-            "   with at least one near the story.",
             "",
-            "---- WHAT GETS RECORDED --------------------------------",
+            "-- WHAT GETS RECORDED --",
             `Enable Nemesis: ${cfg.enabled}`,
             `Automatic discovery: ${cfg.autoDiscover}`,
-            "   Off means no NEW Nemeses are created. Existing cards still work.",
             `Allow survival and retreat guidance: ${cfg.survivalGuidance}`,
-            "   Lets a losing Nemesis flee, yield or be spared rather than dying",
-            "   every time a fight goes against them.",
             "",
-            "---- INNER SELF ----------------------------------------",
+            "-- INNER SELF --",
             `Auto-register Nemeses with Inner Self: ${cfg.autoRegisterInnerSelf}`,
-            "   Gives each Nemesis inner thoughts, if Inner Self is installed.",
             `Rewind Inner Self thoughts on retry/erase: ${cfg.rewindThoughts}`,
-            "   Undoes a thought belonging to a turn you threw away.",
             "",
-            "---- PACING, COUNTED IN TURNS --------------------------",
+            "-- PACING, COUNTED IN TURNS --",
             `Turns between return attempts: ${cfg.returnCooldown}`,
-            "   Global wait after any return is offered.",
             `Turns before same Nemesis can retry: ${cfg.sameNemesisCooldown}`,
-            "   Per-character wait, so one of them cannot monopolise comebacks.",
             `Turns before an unseen Nemesis can return: ${cfg.stalePresentTurns}`,
-            "   How long someone must be off-screen before they count as gone.",
             "",
-            "---- ADVANCED, safe to ignore --------------------------",
+            "-- ADVANCED, safe to ignore --",
             `Nemesis card maintenance limit: ${cfg.historySoftLimit}`,
-            "   Card size in characters before the AI is asked to condense it.",
-            `Nemesis snapshots echoed into model task: ${cfg.maxActiveContextCards}`,
-            "   How many Nemesis cards are described to the AI at once.",
-            "",
-            "Nemesis cards are created automatically. To fix continuity, edit a",
-            "card's Notes section - the Entry regenerates from it."
+            `Nemesis names shown to the AI each turn: ${cfg.maxActiveContextCards}`
         ].map(line => (line === "") ? "" : `> ${line}`).join("\n");
         card.description = [
-            "No NPC list is required.",
-            "A named or uniquely identifiable NPC becomes a Nemesis only after a significant unresolved personal event with the player.",
-            "Normal appearance stays in normal Story Cards. Nemesis stores only evolving deviations: lasting injuries/scars/replacements, life status, rank/status changes, major relationships, compressed history, and current drive.",
-            "Return opportunities are random, but the narrator must veto an appearance that would violate location, access, timing, knowledge, or established story logic.",
-            "Inner Self compatibility: call NemesisHooks.input(), NemesisHooks.context() and NemesisHooks.output() from the three modifier tabs. Output runs Nemesis BEFORE Inner Self; Input and Context run Inner Self first. Do not call the two scripts by hand unless you keep that order."
+            "WHAT EACH SETTING DOES",
+            "Player name — your character. Left as Example, the AI says \"the player\".",
+            "Show hidden Nemesis records — turn on when something looks wrong. Explains what the script did and why. Best thing to screenshot in a bug report.",
+            "Return opportunity chance — chance per turn that a Nemesis who left gets an opening back. The AI can still refuse one that makes no sense.",
+            "Rivalry event chance — chance per turn that two Nemeses cross paths. Needs two alive, one near the story.",
+            "Automatic discovery — off means no NEW Nemeses are created. Existing cards keep working.",
+            "Allow survival and retreat guidance — lets a losing Nemesis flee, yield or be spared rather than dying every time.",
+            "Auto-register Nemeses with Inner Self — gives each one inner thoughts, if Inner Self is installed.",
+            "Rewind Inner Self thoughts on retry/erase — undoes a thought from a turn you threw away.",
+            "Turns between return attempts — global wait after any return is offered.",
+            "Turns before same Nemesis can retry — per-character wait, so one cannot monopolise comebacks.",
+            "Turns before an unseen Nemesis can return — how long off-screen before they count as gone.",
+            "Nemesis card maintenance limit — card size in characters before the AI is asked to condense it.",
+            "Nemesis names shown to the AI each turn — at most this many recently-mentioned Nemeses are named to the AI so it knows which cards to update. 0 names none.",
+            "",
+            "HOW IT WORKS",
+            "No NPC list is required. A named NPC becomes a Nemesis after a significant unresolved personal event with the player.",
+            "A card stores only what the story CHANGED — injuries, status, standing, relationships, history, drive. Ordinary appearance stays in ordinary Story Cards.",
+            "Cards appear on their own. To fix continuity, edit that card's Notes; its Entry regenerates from it."
         ].map(line => `> ${line}`).join("\n\n");
         return cfg;
     };
